@@ -24,6 +24,15 @@ class CompanionSettings:
     gravity_enabled: bool = True
     walking_enabled: bool = True
     companion_scale: float = 1.0
+    # Diagnostic logs — opt-in. Off by default so a normal install doesn't
+    # accumulate prompt files; users with debugging or auditing needs can
+    # flip them on from ``companion settings``.
+    commentary_prompt_log: bool = False
+    """Append every commentary call to ``<companion>/prompts.jsonl``."""
+    art_prompt_log: bool = False
+    """Save the Gemini sprite prompt next to ``sprite.png`` as ``prompt.txt``."""
+    creation_prompt_log: bool = False
+    """Save the profile-creation prompt to ``<companion>/creation_prompt.txt``."""
 
 
 class SettingsStore:
@@ -49,6 +58,9 @@ class SettingsStore:
             gravity_enabled=bool(block.get("gravity_enabled", True)),
             walking_enabled=bool(block.get("walking_enabled", True)),
             companion_scale=float(block.get("companion_scale", 1.0)),
+            commentary_prompt_log=bool(block.get("commentary_prompt_log", False)),
+            art_prompt_log=bool(block.get("art_prompt_log", False)),
+            creation_prompt_log=bool(block.get("creation_prompt_log", False)),
         )
 
     def save(self, settings: CompanionSettings) -> None:

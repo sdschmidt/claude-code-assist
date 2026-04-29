@@ -10,7 +10,7 @@ from PySide6.QtCore import (
     QTimer,
 )
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontMetrics, QPainter, QPainterPath
-from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
+from PySide6.QtWidgets import QGraphicsOpacityEffect, QLabel, QWidget
 
 _FADE_MS = 180
 _AUTO_HIDE_S = 10.0
@@ -29,10 +29,12 @@ class SpeechBubble(QWidget):
         super().__init__()
         # See ``view.py`` — Tool windows hide when the (accessory) app
         # isn't active. Use a plain frameless top-level window instead.
+        # ``WA_ShowWithoutActivating`` keeps the bubble from stealing
+        # focus when it pops up automatically; we deliberately do NOT
+        # set ``WindowDoesNotAcceptFocus`` so the user can click the
+        # bubble to focus it and copy selected text with ⌘C / Ctrl+C.
         self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.WindowDoesNotAcceptFocus,
+            Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint,
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
@@ -50,6 +52,19 @@ class SpeechBubble(QWidget):
         # companion (right-edge fallback). Drives which side the tail
         # is rendered on so it always points at the sprite.
         self._tail_on_right: bool = False
+
+        # Child label renders the text so it can be selected with the
+        # mouse. The parent widget still paints the rounded background
+        # + tail behind it.
+        self._label = QLabel(self)
+        self._label.setFont(self._font)
+        self._label.setWordWrap(True)
+        self._label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard,
+        )
+        self._label.setStyleSheet("background: transparent; color: rgba(255, 255, 255, 220);")
+        self._label.setCursor(Qt.CursorShape.IBeamCursor)
 
         self._opacity = QGraphicsOpacityEffect(self)
         self._opacity.setOpacity(0.0)
@@ -73,6 +88,7 @@ class SpeechBubble(QWidget):
         """Scale the bubble's font + max width to track the companion size."""
         self._scale = max(0.1, scale)
         self._font.setPointSize(max(1, int(round(_BASE_FONT_PT * self._scale))))
+        self._label.setFont(self._font)
         if self._text:
             self._size_to_text()
             self.update()
@@ -106,6 +122,7 @@ class SpeechBubble(QWidget):
         y = max(screen_rect.top(), min(y, screen_rect.bottom() - self.height()))
         if tail_on_right != self._tail_on_right:
             self._tail_on_right = tail_on_right
+            self._position_label()
             self.update()
         self.move(x, y)
 
@@ -139,6 +156,18 @@ class SpeechBubble(QWidget):
         w = rect.width() + _PADDING * 2 + _TAIL
         h = rect.height() + _PADDING * 2
         self.resize(max(48, w), max(28, h))
+        self._label.setText(self._text)
+        self._position_label()
+
+    def _body_rect(self) -> QRect:
+        """Bubble body minus the side reserved for the tail."""
+        if self._tail_on_right:
+            return self.rect().adjusted(0, 0, -_TAIL, 0)
+        return self.rect().adjusted(_TAIL, 0, 0, 0)
+
+    def _position_label(self) -> None:
+        text_rect = self._body_rect().adjusted(_PADDING, _PADDING, -_PADDING, -_PADDING)
+        self._label.setGeometry(text_rect)
 
     def paintEvent(self, _event) -> None:  # noqa: N802 (Qt API)
         if not self._text:
@@ -149,10 +178,7 @@ class SpeechBubble(QWidget):
         # Reserve ``_TAIL`` px on whichever side the tail lives. The
         # bubble body + tail together always occupy the full widget
         # rect, so swapping sides only changes which margin is used.
-        if self._tail_on_right:
-            body_rect = self.rect().adjusted(0, 0, -_TAIL, 0)
-        else:
-            body_rect = self.rect().adjusted(_TAIL, 0, 0, 0)
+        body_rect = self._body_rect()
 
         path = QPainterPath()
         path.addRoundedRect(body_rect, _RADIUS, _RADIUS)
@@ -170,11 +196,3 @@ class SpeechBubble(QWidget):
         path.closeSubpath()
 
         painter.fillPath(path, QColor(20, 20, 22, 230))
-        painter.setPen(QColor(255, 255, 255, 220))
-        painter.setFont(self._font)
-        text_rect = body_rect.adjusted(_PADDING, _PADDING, -_PADDING, -_PADDING)
-        painter.drawText(
-            text_rect,
-            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextWordWrap),
-            self._text,
-        )

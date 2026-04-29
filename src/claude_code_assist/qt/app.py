@@ -2,7 +2,7 @@
 
 Run with::
 
-    python -m claude_code_assist.qt --art-dir <dir> --companion-name <name>
+    python -m claude_code_assist.qt --companion-name <name>
 
 Wires together a 30 Hz timer, the ``CompanionController`` state machine, the
 ``CompanionWindow``, the speech ``SpeechBubble``, the in-process commentary
@@ -26,70 +26,128 @@ _TICK_HZ = 30
 _TICK_INTERVAL_MS = round(1000 / _TICK_HZ)
 
 
-def _print_active_banner(companion) -> None:  # type: ignore[no-untyped-def]
-    """Print the same colored ``Name ★…★ · creature · Lv. N`` line that
-    ``companion art`` and ``companion roster`` use.
+def _install_stdin_quit(app) -> None:  # type: ignore[no-untyped-def]
+    """Wire ``q`` (in the launching TTY) to ``app.quit()``.
 
-    Defers the rich import so the Qt entry-point startup stays cheap
-    when running with ``--debug`` redirected to a non-TTY.
+    Switches stdin to cbreak so single keystrokes arrive without echo;
+    a ``QSocketNotifier`` polls the fd from inside Qt's event loop. The
+    original termios state is restored on app exit.
     """
-    from rich.console import Console  # noqa: PLC0415
+    if not sys.stdin.isatty():
+        return
+    try:
+        import termios  # noqa: PLC0415
+        import tty  # noqa: PLC0415
+
+        from PySide6.QtCore import QSocketNotifier  # noqa: PLC0415
+    except ImportError:
+        return
+
+    fd = sys.stdin.fileno()
+    try:
+        original = termios.tcgetattr(fd)
+    except termios.error:
+        return
+    try:
+        tty.setcbreak(fd)
+    except termios.error:
+        return
+
+    def _restore() -> None:
+        import contextlib  # noqa: PLC0415
+
+        with contextlib.suppress(termios.error):
+            termios.tcsetattr(fd, termios.TCSADRAIN, original)
+
+    notifier = QSocketNotifier(fd, QSocketNotifier.Type.Read, app)
+
+    def _on_ready(_socket: int) -> None:
+        try:
+            ch = sys.stdin.read(1)
+        except (OSError, ValueError):
+            return
+        if ch and ch.lower() == "q":
+            app.quit()
+
+    notifier.activated.connect(_on_ready)
+    app.aboutToQuit.connect(_restore)
+
+
+def _build_status_panel(companion, comment: str, state: str, *, console_width: int):  # type: ignore[no-untyped-def]
+    """Build the rounded status box rendered via ``rich.live``.
+
+    Title border: ``Name ★… · Rarity · Lv. N · creature_type · Role``,
+    using the rarity color for the name/stars/rarity-name and the role
+    catalog's color for the role suffix (matching ``companion new`` /
+    ``companion roster``). Body: the most recent commentary. Subtitle
+    (bottom border): ``XP <bar>`` left-anchored next to the controller
+    state — both packed into a single Rich ``Text`` because Panel
+    only supports one subtitle slot. Padding is computed against
+    ``console_width`` so the state ends up flush against the right
+    corner regardless of terminal width.
+    """
+    from rich.panel import Panel  # noqa: PLC0415
+    from rich.text import Text  # noqa: PLC0415
 
     from claude_code_assist.models.role import ROLE_CATALOG  # noqa: PLC0415
+    from claude_code_assist.profile.leveling import format_xp_bar_segments  # noqa: PLC0415
 
     color = companion.rarity.color
-    role_block = ""
+
+    title = Text()
+    title.append(companion.name, style=f"bold {color}")
+    title.append(f"  {companion.rarity.stars}", style=color)
+    title.append(f"  ·  {companion.rarity.value.title()}", style=color)
+    title.append(f"  ·  Lv. {companion.level}", style="dim")
+    title.append(f"  ·  {companion.creature_type}", style="dim")
     if companion.role is not None:
         defn = ROLE_CATALOG.get(companion.role)
         role_color = defn.color if defn else "#888"
-        role_block = f"  [dim]·[/dim]  [{role_color}]{companion.role.value}[/{role_color}]"
-    Console().print(
-        f"[bold {color}]{companion.name}[/bold {color}]"
-        f"  [{color}]{companion.rarity.stars}[/{color}]"
-        f"  [dim]·  Lv. {companion.level}  ·  {companion.creature_type}[/dim]"
-        f"{role_block}",
+        title.append("  ·  ", style="dim")
+        title.append(companion.role.value, style=role_color)
+
+    body = Text(comment) if comment else Text("(no commentary yet)", style="dim italic")
+
+    xp_filled, xp_empty = format_xp_bar_segments(companion.comment_counter)
+    xp_segment = Text()
+    xp_segment.append(" XP ", style="dim")
+    xp_segment.append(xp_filled, style=color)
+    xp_segment.append(xp_empty, style="dim")
+
+    state_segment = Text(f" {state} ", style="bold dim")
+
+    # Rich's Panel reserves the two corner glyphs and a single space on
+    # each side of the subtitle, so the usable inner width is
+    # ``console_width - 4``. Anything left over after the two segments
+    # becomes a run of ``─`` characters (one per cell) in the gap, which
+    # matches the look of the existing border.
+    used = xp_segment.cell_len + state_segment.cell_len
+    fill = max(2, console_width - 4 - used)
+    subtitle = xp_segment + Text("─" * fill, style="dim") + state_segment
+
+    return Panel(
+        body,
+        title=title,
+        subtitle=subtitle,
+        subtitle_align="left",
+        border_style=color,
+        padding=(1, 2),
     )
-
-
-def _default_config_dir() -> Path:
-    """Mirror ``claude_code_assist.config._default_config_dir`` without importing it.
-
-    Importing the config module pulls in pydantic + the LLM provider
-    stack — overkill for the Qt entry point, which only needs the path
-    while parsing CLI args.
-    """
-    import os
-
-    xdg = os.environ.get("XDG_CONFIG_HOME")
-    if xdg:
-        return Path(xdg) / "claude-code-assist"
-    return Path.home() / ".config" / "claude-code-assist"
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse CLI args. New flags get added here as milestones land."""
     import os
 
-    cfg = _default_config_dir()
+    from claude_code_assist.paths import default_config_dir  # noqa: PLC0415
+
+    cfg = default_config_dir()
     parser = argparse.ArgumentParser(prog="companion", description=__doc__)
     parser.add_argument(
         "--config-dir",
         type=Path,
         default=cfg,
-        help="config directory. Defaults to $XDG_CONFIG_HOME/claude-code-assist.",
-    )
-    parser.add_argument(
-        "--art-dir",
-        type=Path,
-        default=None,
-        help="Directory containing {companion}_frame_{N}.png sprite files. "
-        "Defaults to <config-dir>/art (or whatever the loaded config sets).",
-    )
-    parser.add_argument(
-        "--profile",
-        type=Path,
-        default=None,
-        help="Path to profile.json. Defaults to <config-dir>/companion/profile.json.",
+        help="config directory. Defaults to $XDG_CONFIG_HOME/claude-companion.",
     )
     parser.add_argument(
         "--project",
@@ -121,8 +179,8 @@ def _resolve_paths(args: argparse.Namespace) -> tuple[Path, Path]:
     """
     from claude_code_assist.profile.storage import companion_art_dir, get_profile_path
 
-    art_dir = args.art_dir or companion_art_dir(args.config_dir)
-    profile_path = args.profile or get_profile_path(args.config_dir)
+    art_dir = companion_art_dir(args.config_dir)
+    profile_path = get_profile_path(args.config_dir)
     return art_dir, profile_path
 
 
@@ -175,6 +233,20 @@ def main(argv: list[str] | None = None) -> int:
 
     migrate_legacy_layout(args.config_dir)
 
+    # Per-companion JSONL transcript of every LLM call (system +
+    # user prompt + raw response). Enabled when either ``--debug`` is
+    # passed (the historical knob) or the ``commentary_prompt_log``
+    # setting is on (so users can opt in without restarting under
+    # debug); production runs without either flip stay silent.
+    from claude_code_assist.qt.settings import SettingsStore  # noqa: PLC0415
+
+    transcript_enabled = args.debug or SettingsStore(args.config_dir).load().commentary_prompt_log
+    if transcript_enabled:
+        from claude_code_assist.commentary import transcript  # noqa: PLC0415
+        from claude_code_assist.profile.storage import get_profile_path  # noqa: PLC0415
+
+        transcript.enable(get_profile_path(args.config_dir).parent / "prompts.jsonl")
+
     # Lazy imports so ``import claude_code_assist.qt`` works even when PySide6 is not
     # installed (e.g. someone using only the terminal renderers).
     try:
@@ -212,13 +284,8 @@ def main(argv: list[str] | None = None) -> int:
 
     companion = load_profile(profile_path)
     if companion is None:
-        sys.stderr.write(
-            f"No companion profile found at {profile_path}. "
-            f"Run `companion new` to create one, or pass --profile to point at an existing file.\n"
-        )
+        sys.stderr.write(f"No companion profile found at {profile_path}. Run `companion new` to create one.\n")
         return 1
-
-    _print_active_banner(companion)
 
     # Refuse to start without a complete sprite set — running with empty
     # art produces an invisible companion (the user reported this).
@@ -232,17 +299,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    # Player-driven level-up: if the companion has earned a level
-    # (new day OR enough comments accumulated), prompt the developer
-    # to spend it on a stat boost. The flow is interactive on stdin —
-    # ``companion levelup`` runs the same path without the eligibility
-    # check for debugging.
-    from claude_code_assist.cli._levelup_flow import run_levelup_interactive  # noqa: PLC0415
-    from claude_code_assist.profile.leveling import is_eligible_for_levelup  # noqa: PLC0415
+    # Seed ``last_seen_date`` on a freshly created companion so the
+    # eligibility check has a baseline to compare against. Level-ups
+    # themselves are no longer prompted at startup — the tray surfaces
+    # them via a yellow "Level up available!" entry + halo on the icon
+    # and routes the player through ``LevelUpDialog`` when they choose.
+    # ``companion levelup`` (questionary) is still available as a
+    # debug-only force path.
+    from claude_code_assist.profile.leveling import seed_last_seen_date  # noqa: PLC0415
 
-    if is_eligible_for_levelup(companion):
-        if run_levelup_interactive(companion, force=False):
-            save_profile(companion, profile_path)
+    if seed_last_seen_date(companion):
+        save_profile(companion, profile_path)
 
     # QApplication must exist before any QPixmap is constructed.
     app = QApplication(sys.argv)
@@ -341,6 +408,30 @@ def main(argv: list[str] | None = None) -> int:
         window.set_scale(scale)
         bubble.set_scale(scale)
 
+    def _on_levelup_requested() -> None:
+        from claude_code_assist.qt.levelup_dialog import LevelUpDialog  # noqa: PLC0415
+
+        dialog = LevelUpDialog(companion)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        save_profile(companion, profile_path)
+        tray.refresh_levelup()  # type: ignore[attr-defined]
+
+        # Speech bubble: same news the dialog showed, surfaced next to
+        # the sprite so it lingers after the modal closes.
+        if dialog.chosen_stat is not None and dialog.new_stat_value is not None and dialog.new_level is not None:
+            parts = [f"+1 {dialog.chosen_stat} (now {dialog.new_stat_value}/100) — Lv. {dialog.new_level}"]
+            if (
+                dialog.new_rarity is not None
+                and dialog.old_rarity is not None
+                and dialog.new_rarity != dialog.old_rarity
+            ):
+                parts.append(
+                    f"{dialog.old_rarity.value.title()} → {dialog.new_rarity.value.title()} {dialog.new_rarity.stars}"
+                )
+            controller.react()
+            bubble.show_comment(" · ".join(parts), duration_s=8.0)
+
     session_label = _resolve_session_label(args, encode_project_path, find_newest_session)
     tray = install_tray(  # noqa: F841 — strong ref for lifetime
         app,
@@ -358,6 +449,7 @@ def main(argv: list[str] | None = None) -> int:
         on_gravity_toggled=_set_gravity,
         on_walking_toggled=_set_walking,
         on_scale_changed=_set_scale,
+        on_levelup_requested=_on_levelup_requested,
     )
 
     # Mouse → controller. The controller owns position; the view just relays
@@ -401,11 +493,30 @@ def main(argv: list[str] | None = None) -> int:
 
     window.on_mouse_double_click = _on_double_click
 
-    # Print the initial state line below the banner; subsequent state
-    # changes update it in place via cursor-up + clear-line.
-    sys.stdout.write(f"state: {controller.state_name}\n")
-    sys.stdout.flush()
-    last_state = {"name": controller.state_name}
+    # Persistent terminal status panel. Re-renders only when the
+    # commentary or controller state changes so the redraw cost stays
+    # tiny even though we're called at 30 Hz.
+    from rich.console import Console  # noqa: PLC0415
+    from rich.live import Live  # noqa: PLC0415
+
+    panel_state = {
+        "comment": companion.last_comment or "",
+        "state": controller.state_name,
+        "xp": companion.comment_counter,
+    }
+    panel_console = Console()
+    live = Live(
+        _build_status_panel(
+            companion,
+            panel_state["comment"],
+            panel_state["state"],
+            console_width=panel_console.width,
+        ),
+        console=panel_console,
+        auto_refresh=False,
+        transient=False,
+    )
+    live.start(refresh=True)
 
     def on_tick() -> None:
         # Re-query each tick so the companion follows window moves between screens.
@@ -430,12 +541,28 @@ def main(argv: list[str] | None = None) -> int:
         window.set_position(x, y)
         bubble.reposition(QRect(x, y, controller.sprite_width, controller.sprite_height), rect)
 
-        # Update the in-place state line on transitions only.
-        current = controller.state_name
-        if current != last_state["name"]:
-            last_state["name"] = current
-            sys.stdout.write(f"\033[1A\r\033[Kstate: {current}\n")
-            sys.stdout.flush()
+        # Repaint the status panel only on commentary / state / XP transitions.
+        needs_redraw = False
+        if update.new_comment and update.new_comment != panel_state["comment"]:
+            panel_state["comment"] = update.new_comment
+            needs_redraw = True
+        current_state = controller.state_name
+        if current_state != panel_state["state"]:
+            panel_state["state"] = current_state
+            needs_redraw = True
+        if companion.comment_counter != panel_state["xp"]:
+            panel_state["xp"] = companion.comment_counter
+            needs_redraw = True
+        if needs_redraw:
+            live.update(
+                _build_status_panel(
+                    companion,
+                    panel_state["comment"],
+                    panel_state["state"],
+                    console_width=panel_console.width,
+                ),
+                refresh=True,
+            )
 
     timer = QTimer()
     timer.setInterval(_TICK_INTERVAL_MS)
@@ -465,9 +592,18 @@ def main(argv: list[str] | None = None) -> int:
     sigint_pump.start(100)
     sigint_pump.timeout.connect(lambda: None)
 
+    # Press ``q`` in the launching terminal to quit. Only enabled if stdin
+    # is a TTY (so piping or daemonising won't trip on the cbreak switch).
+    # ``cbreak`` disables ICANON + ECHO so single keys arrive immediately
+    # and the user doesn't see typed characters echoed onto the Live panel.
+    _install_stdin_quit(app)
+
     # Persist the rolling comment_history when the app quits so the next
-    # launch carries on with the same context the LLM saw.
-    app.aboutToQuit.connect(lambda: (backend.stop(), save_profile(companion, profile_path)))
+    # launch carries on with the same context the LLM saw, and stop the
+    # Live status panel so the terminal isn't left mid-render.
+    app.aboutToQuit.connect(
+        lambda: (backend.stop(), save_profile(companion, profile_path), live.stop()),
+    )
 
     backend.start()
     rc = app.exec()

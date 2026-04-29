@@ -33,6 +33,7 @@ from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
 
+from claude_code_assist.cli._picker import PICKER_STYLE, bind_shortcuts, menu_title
 from claude_code_assist.config import CompanionConfig, load_config
 from claude_code_assist.models.rarity import pick_rarity
 from claude_code_assist.models.role import ROLE_CATALOG, Role, picker_label_styled
@@ -77,7 +78,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--config-dir",
         type=Path,
         default=None,
-        help="Config directory override. Defaults to $XDG_CONFIG_HOME/claude-code-assist.",
+        help="Config directory override. Defaults to $XDG_CONFIG_HOME/claude-companion.",
     )
     parser.add_argument(
         "--yes",
@@ -119,26 +120,31 @@ def run(argv: list[str]) -> int:
     # *previous* companion is never deleted — it just stops being
     # active when this run completes.
     active_dir = get_active_companion_dir(config.config_dir)
-    if active_dir is not None:
+    if active_dir is not None and not args.yes:
         existing = load_profile(active_dir / PROFILE_FILENAME)
         existing_name = existing.name if existing is not None else active_dir.name
-        if not args.yes and not _ask_confirm(
-            f"A companion named '{existing_name}' is currently active. Generate a new one and "
-            "switch to it? (the previous companion stays in your roster, just not active)",
-            default=True,
-        ):
+        prompt = (
+            f"A companion named '{existing_name}' is currently active. "
+            "Generate a new one and switch to it? "
+            "(the previous companion stays in your roster, just not active)"
+        )
+        if _pick_new_or_quit(prompt) != "new":
             console.print("[yellow]Aborted — keeping the current companion.[/yellow]")
             return 0
 
+    from claude_code_assist.qt.settings import SettingsStore  # noqa: PLC0415
+
+    settings = SettingsStore(config.config_dir).load()
+
     mode = args.mode or _pick_mode_interactive()
-    if mode is None:
-        return 0  # user pressed Ctrl-C / Esc on the picker
+    if mode is None or mode == "quit":
+        return 0  # Ctrl-C, Esc, or explicit quit
     while True:
         criteria = _collect_criteria(mode, config)
         rarity = pick_rarity(config.rarity_weights)
         with console.status(f"[cyan]Generating a {rarity.value.lower()} companion…[/cyan]", spinner="dots"):
             try:
-                companion = generate_companion(config, rarity=rarity, criteria=criteria)
+                companion, creation_prompt = generate_companion(config, rarity=rarity, criteria=criteria)
             except RuntimeError as exc:
                 console.print(f"[red]Generation failed:[/red] {exc}")
                 if not _ask_confirm("Try again?", default=True):
@@ -165,6 +171,8 @@ def run(argv: list[str]) -> int:
             profile_path = slot_dir / PROFILE_FILENAME
             save_profile(companion, profile_path)
             set_active_slot(config.config_dir, slot_dir.name)
+            if settings.creation_prompt_log:
+                (slot_dir / "creation_prompt.txt").write_text(creation_prompt, encoding="utf-8")
             if choice is None:
                 console.print(
                     f"[green]Saved {companion.name} to {profile_path}.[/green] "
@@ -179,7 +187,7 @@ def run(argv: list[str]) -> int:
             return 0
         # Reroll — let the user pick a different mode (or keep the current one).
         next_mode = _pick_mode_interactive(default=mode)
-        if next_mode is None:
+        if next_mode is None or next_mode == "quit":
             console.print("[yellow]Aborted — nothing saved.[/yellow]")
             return 0
         mode = next_mode
@@ -190,17 +198,19 @@ def run(argv: list[str]) -> int:
 # ---------------------------------------------------------------------------
 
 
-_MODE_CHOICES: tuple[tuple[str, str], ...] = (
-    ("free", "Give a prompt — describe your companion freely"),
-    ("quiz", "Answer a short quiz — Claude asks 3-5 questions"),
-    ("random", "Just random — pure roll, no input"),
+# (value, shortcut, label, description).
+_MODE_CHOICES: tuple[tuple[str, str, str, str], ...] = (
+    ("free", "p", "prompt", "describe your companion freely"),
+    ("quiz", "z", "quiz", "answer a few short questions"),
+    ("random", "r", "random", "pure roll, no input"),
+    ("quit", "q", "quit", "leave without generating"),
 )
 
 
-_ACTION_CHOICES: tuple[tuple[str, str], ...] = (
-    ("proceed", "Proceed — save this companion"),
-    ("reroll", "Reroll — try a different generation"),
-    ("quit", "Quit — discard and exit"),
+_ACTION_CHOICES: tuple[tuple[str, str, str, str], ...] = (
+    ("proceed", "p", "proceed", "save this companion"),
+    ("reroll", "r", "reroll", "try a different generation"),
+    ("quit", "q", "quit", "discard and exit"),
 )
 
 
@@ -213,12 +223,30 @@ def _ask_confirm(message: str, *, default: bool = False) -> bool:
     return bool(answer) if answer is not None else False
 
 
+_NEW_OR_QUIT_CHOICES: tuple[tuple[str, str, str, str], ...] = (
+    ("new", "n", "new", "generate a new companion"),
+    ("quit", "q", "quit", ""),
+)
+
+
+def _pick_new_or_quit(message: str) -> str | None:
+    """Two-row select used in place of a yes/no overwrite confirmation."""
+    choices = [
+        questionary.Choice(title=menu_title(label, description, shortcut=key), value=value)
+        for value, key, label, description in _NEW_OR_QUIT_CHOICES
+    ]
+    shortcut_map = {key: value for value, key, _, _ in _NEW_OR_QUIT_CHOICES}
+    try:
+        question = questionary.select(message, choices=choices, style=PICKER_STYLE)
+        bind_shortcuts(question, shortcut_map)
+        return question.ask()
+    except (KeyboardInterrupt, EOFError):
+        return None
+
+
 def _pick_role_interactive() -> Role | None:
     """Arrow-key picker for the companion's role. ``None`` if user cancels."""
-    choices = [
-        questionary.Choice(title=picker_label_styled(defn), value=role)
-        for role, defn in ROLE_CATALOG.items()
-    ]
+    choices = [questionary.Choice(title=picker_label_styled(defn), value=role) for role, defn in ROLE_CATALOG.items()]
     try:
         return questionary.select(
             "Choose a role for this companion:",
@@ -230,13 +258,20 @@ def _pick_role_interactive() -> Role | None:
 
 def _pick_proceed_action() -> str | None:
     """Arrow-key picker for proceed / reroll / quit. ``None`` on cancel."""
-    labels = [questionary.Choice(title=label, value=value) for value, label in _ACTION_CHOICES]
+    labels = [
+        questionary.Choice(title=menu_title(label, description, shortcut=key), value=value)
+        for value, key, label, description in _ACTION_CHOICES
+    ]
+    shortcut_map = {key: value for value, key, _, _ in _ACTION_CHOICES}
     try:
-        choice = questionary.select(
+        question = questionary.select(
             "What now?",
             choices=labels,
             default=labels[0],
-        ).ask()
+            style=PICKER_STYLE,
+        )
+        bind_shortcuts(question, shortcut_map)
+        choice = question.ask()
     except (KeyboardInterrupt, EOFError):
         return None
     return None if choice is None else str(choice)
@@ -250,16 +285,22 @@ def _pick_mode_interactive(default: str | None = None) -> str | None:
     choice stays preselected). Arrow keys move the highlight; Enter
     confirms; Ctrl-C / Esc cancels and returns ``None``.
     """
-    labels = [questionary.Choice(title=label, value=value) for value, label in _MODE_CHOICES]
-    select_kwargs: dict[str, object] = {}
+    labels = [
+        questionary.Choice(title=menu_title(label, description, shortcut=key), value=value)
+        for value, key, label, description in _MODE_CHOICES
+    ]
+    shortcut_map = {key: value for value, key, _, _ in _MODE_CHOICES}
+    select_kwargs: dict[str, object] = {"style": PICKER_STYLE}
     if default is not None:
         select_kwargs["default"] = next((c for c in labels if c.value == default), labels[0])
     try:
-        choice = questionary.select(
+        question = questionary.select(
             "How do you want to design your companion?",
             choices=labels,
             **select_kwargs,  # type: ignore[arg-type]
-        ).ask()
+        )
+        bind_shortcuts(question, shortcut_map)
+        choice = question.ask()
     except (KeyboardInterrupt, EOFError):
         return None
     if choice is None:
@@ -466,11 +507,10 @@ def _show_companion(companion: CompanionProfile) -> None:
 
 def _load_or_default_config(config_dir: Path | None) -> CompanionConfig:
     """Load ``config.json`` if present, otherwise return defaults bound to ``config_dir``."""
-    import os
-
     if config_dir is None:
-        xdg = os.environ.get("XDG_CONFIG_HOME")
-        config_dir = Path(xdg) / "claude-code-assist" if xdg else Path.home() / ".config" / "claude-code-assist"
+        from claude_code_assist.paths import default_config_dir  # noqa: PLC0415
+
+        config_dir = default_config_dir()
 
     # Run the legacy migration first so a config.yaml or companion_settings.json
     # left over from earlier launches gets folded into config.json.

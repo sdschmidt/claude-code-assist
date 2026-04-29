@@ -76,6 +76,7 @@ def remove_chroma_key(
     tolerance: int = 80,
     target_color: tuple[int, int, int] | None = CHROMA_BG,
     contiguous: bool = True,
+    feather_px: int = 0,
 ) -> Image.Image:
     """Remove the magenta background.
 
@@ -83,6 +84,13 @@ def remove_chroma_key(
     pixels are removed (preserves interior chroma). With
     ``contiguous=False`` every pixel within tolerance is cleared,
     including pockets enclosed by the character outline.
+
+    ``feather_px`` shrinks the opaque region inward by that many pixels
+    with a linear alpha ramp at the new edge. Useful for killing the
+    last sliver of pink halo that survives the binary tolerance check
+    — e.g. anti-aliased outline pixels whose color is character +
+    chroma blend but falls outside ``tolerance``. ``0`` disables the
+    feather entirely.
     """
     detected_bg = bg_color or _detect_bg_color(image, target_color=target_color)
 
@@ -107,10 +115,7 @@ def remove_chroma_key(
     for _ in range(2):
         padded = np.pad(alpha, 1, constant_values=1.0)
         has_transparent_neighbor = (
-            (padded[:-2, 1:-1] == 0)
-            | (padded[2:, 1:-1] == 0)
-            | (padded[1:-1, :-2] == 0)
-            | (padded[1:-1, 2:] == 0)
+            (padded[:-2, 1:-1] == 0) | (padded[2:, 1:-1] == 0) | (padded[1:-1, :-2] == 0) | (padded[1:-1, 2:] == 0)
         )
         edge_mask = has_transparent_neighbor & (~background) & (dist <= tolerance * 1.5)
         alpha[edge_mask] = 0.0
@@ -118,7 +123,33 @@ def remove_chroma_key(
 
     result = arr.copy()
     result[background, 3] = 0
+
+    if feather_px > 0:
+        feather = _feather_alpha(background, feather_px)
+        result[:, :, 3] = np.clip(result[:, :, 3].astype(np.float64) * feather, 0, 255).astype(np.uint8)
+
     return Image.fromarray(result, mode="RGBA")
+
+
+def _feather_alpha(background: np.ndarray, radius: int) -> np.ndarray:
+    """Return float [0,1] alpha that ramps from 0 at ``background`` to 1 ``radius`` pixels inward.
+
+    Iteratively shrinks the opaque region using a 4-neighborhood
+    min-filter with a fixed step of ``1 / (radius + 1)``. After
+    ``radius`` iterations the boundary of opaque pixels has values
+    ``1/(radius+1), 2/(radius+1), …, radius/(radius+1)`` while pixels
+    deeper inside stay at ``1.0``.
+    """
+    alpha = np.where(background, 0.0, 1.0)
+    step = 1.0 / (radius + 1)
+    for _ in range(radius):
+        padded = np.pad(alpha, 1, constant_values=0.0)
+        neighbor_min = np.minimum(
+            np.minimum(padded[:-2, 1:-1], padded[2:, 1:-1]),
+            np.minimum(padded[1:-1, :-2], padded[1:-1, 2:]),
+        )
+        alpha = np.minimum(alpha, neighbor_min + step)
+    return alpha
 
 
 def _flood_fill_from_edges(is_bg_local: np.ndarray) -> np.ndarray:
@@ -228,52 +259,85 @@ def paint_over_grid_lines(
 def detect_2x5_cells(
     image: Image.Image,
     *,
-    darkness_threshold: int = 80,
+    chroma_color: tuple[int, int, int] = CHROMA_BG,
+    chroma_tolerance: int = 40,
+    row_corridor_threshold: float = 0.985,
 ) -> list[tuple[int, int, int, int]] | None:
-    """Find the 10 cell rectangles by locating the dark grid lines.
+    """Find the 10 cell rectangles by locating horizontal magenta corridors.
 
-    Returns a list of ``(left, top, right, bottom)`` rects, or ``None``
-    if the expected 1 vertical + 4 horizontal lines weren't found.
+    Assumes any grid lines have already been painted over with the
+    chroma color (see ``paint_over_grid_lines``); the splitter looks for
+    bands of near-pure ``chroma_color`` between rows, not dark lines.
+
+    Algorithm:
+
+    1. Build a per-pixel mask of pixels within ``chroma_tolerance`` of
+       ``chroma_color``.
+    2. **Horizontal corridors** — contiguous rows whose chroma fraction
+       is at least ``row_corridor_threshold``. Stored as
+       ``(ymin, ymax)``; these are the gaps between frame rows (plus
+       any top/bottom borders).
+    3. **Frame rows** — the strips of non-corridor pixels between
+       consecutive corridors. Expect exactly 5 for a 2×5 sheet.
+    4. **Column split** — fixed at the geometric midline. For an even
+       width both cells are exactly ``w // 2`` pixels wide; for an odd
+       width the single middle pixel is dropped (left ends at
+       ``w // 2``, right starts at ``(w + 1) // 2``) so the cells stay
+       equal-sized. Per-row corridor search would let mildly
+       misaligned cells drift, while the artist always lays out
+       exactly two equal columns.
+
+    Returns ``None`` if 5 frame rows can't be identified.
     """
     img = image.convert("RGB")
-    arr = np.array(img)
+    arr = np.array(img).astype(np.int16)
     h, w = arr.shape[:2]
-    luma = arr.mean(axis=2)
 
-    col_luma = luma.mean(axis=0)
-    row_luma = luma.mean(axis=1)
+    chroma = np.array(chroma_color, dtype=np.int16)
+    is_chroma = np.abs(arr - chroma).max(axis=2) <= chroma_tolerance
 
-    v_lines = _find_dark_runs(col_luma, darkness_threshold)
-    h_lines = _find_dark_runs(row_luma, darkness_threshold)
-
-    # Need exactly 1 vertical, 4 horizontal lines for the 2x5 grid.
-    if len(v_lines) != 1 or len(h_lines) != 4:
-        logger.debug("Grid detection failed: %d v-lines, %d h-lines", len(v_lines), len(h_lines))
+    is_corridor_row = is_chroma.mean(axis=1) >= row_corridor_threshold
+    corridors = _find_runs(is_corridor_row)
+    if not corridors:
+        logger.debug("No horizontal magenta corridors detected")
         return None
 
-    v_left, v_right = v_lines[0]
-    col_bounds = [(0, v_left), (v_right, w)]
-    row_bounds: list[tuple[int, int]] = []
+    frame_rows: list[tuple[int, int]] = []
     prev_end = 0
-    for hl_lo, hl_hi in h_lines:
-        row_bounds.append((prev_end, hl_lo))
-        prev_end = hl_hi
-    row_bounds.append((prev_end, h))
+    for cstart, cend in corridors:
+        if cstart > prev_end:
+            frame_rows.append((prev_end, cstart))
+        prev_end = cend
+    if prev_end < h:
+        frame_rows.append((prev_end, h))
 
+    min_row_height = max(4, h // 50)
+    frame_rows = [r for r in frame_rows if r[1] - r[0] >= min_row_height]
+
+    if len(frame_rows) != 5:
+        logger.debug(
+            "Detected %d frame rows from %d corridors; expected 5",
+            len(frame_rows),
+            len(corridors),
+        )
+        return None
+
+    left_end = w // 2
+    right_start = (w + 1) // 2
     cells: list[tuple[int, int, int, int]] = []
-    for top, bottom in row_bounds:
-        for left, right in col_bounds:
-            cells.append((left, top, right, bottom))
+    for ystart, yend in frame_rows:
+        cells.append((0, ystart, left_end, yend))
+        cells.append((right_start, ystart, w, yend))
     return cells
 
 
-def _find_dark_runs(profile: np.ndarray, threshold: int) -> list[tuple[int, int]]:
-    """Return ``[(start, end), …]`` of contiguous indices whose luma < threshold."""
+def _find_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Return ``[(start, end_exclusive), …]`` of contiguous True runs in a 1D bool mask."""
     runs: list[tuple[int, int]] = []
     in_run = False
     start = 0
-    for i, v in enumerate(profile):
-        if v < threshold:
+    for i, v in enumerate(mask):
+        if v:
             if not in_run:
                 in_run = True
                 start = i
@@ -281,9 +345,8 @@ def _find_dark_runs(profile: np.ndarray, threshold: int) -> list[tuple[int, int]
             in_run = False
             runs.append((start, i))
     if in_run:
-        runs.append((start, len(profile)))
-    # Filter very thin runs (< 3px) — those are antialiasing noise, not grid lines.
-    return [r for r in runs if r[1] - r[0] >= 3]
+        runs.append((start, len(mask)))
+    return runs
 
 
 def split_sprite_sheet_2x5(image: Image.Image, *, inset_px: int = 0) -> list[Image.Image]:

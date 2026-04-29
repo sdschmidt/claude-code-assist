@@ -38,6 +38,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _COMMENT_HISTORY_MAX = 20  # match tpet.app.COMMENT_HISTORY_MAX
+_RECENT_EVENTS_MAX = 5
+"""Rolling window of session turns the companion sees as context.
+
+The most recent event is always the focal one passed to ``submit_*``;
+the prior 4 are surfaced as conversation history so the LLM can react
+to patterns (e.g. "they've been stuck on this for several turns")
+rather than only to the single line that just arrived.
+"""
 
 
 def _is_direct_address(text: str, companion: CompanionProfile) -> bool:
@@ -102,7 +110,7 @@ class CommentaryBackend:
 
         self._pending_comment: Future[str | None] | None = None
         self._pending_idle: Future[str | None] | None = None
-        self._last_user_event: SessionEvent | None = None
+        self._recent_events: list[SessionEvent] = []
         self._comment_count = 0
         # Use ``-inf`` so the first event is never blocked by the cooldown.
         self._last_comment_time = float("-inf")
@@ -170,24 +178,24 @@ class CommentaryBackend:
             event = None
 
         if event is not None:
-            if event.role == "user":
-                self._last_user_event = event
+            self._record_event(event)
             self._pending_comment = submit_comment(
                 self._companion,
                 event,
                 config=self._config,
                 max_length=self._config.max_comment_length,
-                last_user_event=self._last_user_event,
+                recent_events=list(self._recent_events[:-1]),
             )
             return True
 
-        if self._last_user_event is not None:
+        if self._recent_events:
+            focal = self._recent_events[-1]
             self._pending_comment = submit_comment(
                 self._companion,
-                self._last_user_event,
+                focal,
                 config=self._config,
                 max_length=self._config.max_comment_length,
-                last_user_event=self._last_user_event,
+                recent_events=list(self._recent_events[:-1]),
             )
             return True
 
@@ -248,8 +256,8 @@ class CommentaryBackend:
 
         if event is not None:
             update.had_event = True
-            if event.role == "user":
-                self._last_user_event = event
+            self._record_event(event)
+            prior_events = list(self._recent_events[:-1])
 
             # Direct address: the developer mentioned the companion by
             # name or by role in their message. Skip the cooldown and
@@ -266,6 +274,7 @@ class CommentaryBackend:
                     event.summary,
                     config=self._config,
                     max_length=self._config.max_comment_length,
+                    recent_events=prior_events,
                 )
             elif (
                 self._pending_comment is None
@@ -277,7 +286,7 @@ class CommentaryBackend:
                     event,
                     config=self._config,
                     max_length=self._config.max_comment_length,
-                    last_user_event=self._last_user_event,
+                    recent_events=prior_events,
                 )
 
         # 4. Idle chatter when the session has gone quiet.
@@ -299,6 +308,12 @@ class CommentaryBackend:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _record_event(self, event: SessionEvent) -> None:
+        """Append ``event`` to the rolling session-context window."""
+        self._recent_events.append(event)
+        if len(self._recent_events) > _RECENT_EVENTS_MAX:
+            self._recent_events = self._recent_events[-_RECENT_EVENTS_MAX:]
 
     def _record_comment(self, comment: str) -> None:
         self._companion.last_comment = comment

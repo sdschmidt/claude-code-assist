@@ -23,6 +23,14 @@ class CompanionProfile(BaseModel):
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC), description="UTC timestamp of companion creation."
     )
+    last_activated_at: datetime | None = Field(
+        default=None,
+        description=(
+            "UTC timestamp of the most recent activation (``set_active_slot``). "
+            "``None`` for legacy profiles created before this field existed; the "
+            "roster picker falls back to ``created_at`` for sorting in that case."
+        ),
+    )
     last_comment: str | None = Field(default=None, description="Most recent comment text, persisted across sessions.")
     comment_history: list[str] = Field(
         default_factory=list, description="Rolling history of recent comments (max 20 entries)."

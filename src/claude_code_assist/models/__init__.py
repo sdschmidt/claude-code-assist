@@ -10,7 +10,13 @@ from claude_code_assist.models.rarity import (
     rarity_for_peak_stat,
 )
 from claude_code_assist.models.role import ROLE_CATALOG, Role, RoleDef, picker_label, picker_label_styled
-from claude_code_assist.models.stats import DEFAULT_STAT_NAMES, STAT_DEFINITIONS, StatConfig, generate_stats, shape_stats
+from claude_code_assist.models.stats import (
+    DEFAULT_STAT_NAMES,
+    STAT_DEFINITIONS,
+    StatConfig,
+    generate_stats,
+    shape_stats,
+)
 
 __all__ = [
     "DEFAULT_RARITY_WEIGHTS",

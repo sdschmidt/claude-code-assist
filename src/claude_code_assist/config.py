@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
-from xdg_base_dirs import xdg_config_home
 
 from claude_code_assist.models.rarity import DEFAULT_RARITY_WEIGHTS, Rarity
 from claude_code_assist.models.stats import StatConfig
@@ -205,7 +204,9 @@ class BubblePlacement(StrEnum):
 
 
 def _default_config_dir() -> Path:
-    return xdg_config_home() / "claude-code-assist"
+    from claude_code_assist.paths import default_config_dir  # noqa: PLC0415
+
+    return default_config_dir()
 
 
 class CompanionConfig(BaseModel):

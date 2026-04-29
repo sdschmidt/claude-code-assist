@@ -262,7 +262,7 @@ async def _generate_companion_async(
     config: CompanionConfig,
     rarity: Rarity,
     criteria: str | None = None,
-) -> CompanionProfile:
+) -> tuple[CompanionProfile, str]:
     """Generate a companion profile using the configured LLM provider."""
     if rarity == Rarity.COMMON:
         complexity = "simple"
@@ -278,20 +278,73 @@ async def _generate_companion_async(
     rng = random.Random(seed)
 
     adjectives = [
-        "whimsical", "mischievous", "stoic", "energetic", "lazy", "curious",
-        "grumpy", "cheerful", "sassy", "shy", "brave", "clumsy", "wise",
-        "chaotic", "gentle", "fierce", "dreamy", "sneaky", "noble", "quirky",
+        "whimsical",
+        "mischievous",
+        "stoic",
+        "energetic",
+        "lazy",
+        "curious",
+        "grumpy",
+        "cheerful",
+        "sassy",
+        "shy",
+        "brave",
+        "clumsy",
+        "wise",
+        "chaotic",
+        "gentle",
+        "fierce",
+        "dreamy",
+        "sneaky",
+        "noble",
+        "quirky",
     ]
     species_hints = [
-        "elemental", "sprite", "familiar", "spirit", "golem", "slime", "dragon",
-        "cat", "bird", "bug", "robot", "ghost", "plant", "fish", "demon", "angel",
-        "goblin", "fox", "blob", "crystal",
+        "elemental",
+        "sprite",
+        "familiar",
+        "spirit",
+        "golem",
+        "slime",
+        "dragon",
+        "cat",
+        "bird",
+        "bug",
+        "robot",
+        "ghost",
+        "plant",
+        "fish",
+        "demon",
+        "angel",
+        "goblin",
+        "fox",
+        "blob",
+        "crystal",
     ]
     themes = [
-        "code", "bugs", "compilers", "networks", "databases", "cloud", "pixels",
-        "shaders", "threads", "memory", "stacks", "loops", "regex", "syntax",
-        "debugging", "recursion", "linting", "types", "containers", "terminals",
-        "git", "merge conflicts", "deploys",
+        "code",
+        "bugs",
+        "compilers",
+        "networks",
+        "databases",
+        "cloud",
+        "pixels",
+        "shaders",
+        "threads",
+        "memory",
+        "stacks",
+        "loops",
+        "regex",
+        "syntax",
+        "debugging",
+        "recursion",
+        "linting",
+        "types",
+        "containers",
+        "terminals",
+        "git",
+        "merge conflicts",
+        "deploys",
     ]
 
     adj = rng.choice(adjectives)
@@ -321,7 +374,7 @@ async def _generate_companion_async(
         hints = {str(k): int(v) for k, v in raw_stats.items() if isinstance(v, int | float)}
     stats = shape_stats(rarity, hints, names=list(DEFAULT_STAT_NAMES))
 
-    return CompanionProfile(
+    companion = CompanionProfile(
         name=name,
         creature_type=str(data["creature_type"]),
         rarity=rarity,
@@ -334,29 +387,34 @@ async def _generate_companion_async(
         fall_description=str(data.get("fall_description", "")).strip(),
         landing_description=str(data.get("landing_description", "")).strip(),
     )
+    full_prompt = (
+        "=== SYSTEM PROMPT ===\n"
+        f"{_SYSTEM_PROMPT}\n\n"
+        "=== USER PROMPT ===\n"
+        f"{user_prompt}\n"
+    )
+    return companion, full_prompt
 
 
 def generate_companion(
     config: CompanionConfig,
     rarity: Rarity,
     criteria: str | None = None,
-) -> CompanionProfile:
+) -> tuple[CompanionProfile, str]:
     """Generate a new companion profile using the configured LLM provider.
 
+    Returns ``(companion, full_prompt_text)`` so callers that opt into
+    creation-prompt logging can persist the exact prompt the LLM saw.
     Retries up to 3 times on failure (e.g. invalid JSON from the model).
     """
-    result = _run_with_retries(
-        _generate_companion_async, config, rarity, criteria, context="Companion generation"
-    )
+    result = _run_with_retries(_generate_companion_async, config, rarity, criteria, context="Companion generation")
     return result  # type: ignore[return-value]
 
 
 _LOCOMOTION_BACKFILL_SYSTEM_PROMPT = (
     "You are a creature designer filling in missing animation fields for an existing companion. "
     "You will be given the companion's name, creature type, personality, and backstory. "
-    "Produce four short descriptors used by an image-generation pipeline.\n\n"
-    + _LOCOMOTION_INSTRUCTIONS
-    + "\n"
+    "Produce four short descriptors used by an image-generation pipeline.\n\n" + _LOCOMOTION_INSTRUCTIONS + "\n"
     "IMPORTANT: Output ONLY a single JSON object with no markdown fencing, no explanation, "
     "and no extra text. The JSON must have these exact keys:\n"
     '- "body_plan": string\n'
@@ -391,7 +449,9 @@ def ensure_locomotion_descriptors(
     config: CompanionConfig, companion: CompanionProfile
 ) -> tuple[CompanionProfile, bool]:
     """Return ``(companion, updated)`` with locomotion fields filled in."""
-    if all([companion.body_plan, companion.walk_description, companion.fall_description, companion.landing_description]):
+    if all(
+        [companion.body_plan, companion.walk_description, companion.fall_description, companion.landing_description]
+    ):
         return companion, False
 
     descriptors = _run_with_retries(_backfill_locomotion_async, config, companion, context="Locomotion backfill")

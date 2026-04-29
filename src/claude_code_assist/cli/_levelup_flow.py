@@ -43,15 +43,10 @@ def run_levelup_interactive(companion: CompanionProfile, *, force: bool = False)
         f"  ·  {reason}[/dim]"
     )
 
-    try:
-        proceed = questionary.confirm(
-            "Level up your companion?",
-            default=True,
-        ).ask()
-    except (KeyboardInterrupt, EOFError):
-        return False
-    if not proceed:
-        return False
+    # No "Level up your companion?" prompt: reaching this function
+    # already implies the user picked "levelup" from the menu (or ran
+    # the ``companion levelup`` debug command), so a second confirm
+    # is just friction. Skip straight to the stat picker.
 
     stat_choices = [
         questionary.Choice(

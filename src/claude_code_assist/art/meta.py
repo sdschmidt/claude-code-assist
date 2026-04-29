@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -17,7 +17,7 @@ META_FILENAME = "meta.json"
 class ArtMeta(BaseModel):
     """Provenance for a generated / prefilled art set."""
 
-    datetime_of_creation: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    datetime_of_creation: datetime = Field(default_factory=lambda: datetime.now(UTC))
     model: str = "unknown"
     prompt: str = ""
 

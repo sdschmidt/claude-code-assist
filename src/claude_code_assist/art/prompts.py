@@ -46,8 +46,7 @@ def _layout_instructions(companion: CompanionProfile, overrides: LocomotionOverr
     )
     fall = _resolve(
         overrides.fall_description if overrides else None,
-        companion.fall_description
-        or "Airborne with limbs splayed and a startled expression — no ground under it.",
+        companion.fall_description or "Airborne with limbs splayed and a startled expression — no ground under it.",
     )
     landing = _resolve(
         overrides.landing_description if overrides else None,

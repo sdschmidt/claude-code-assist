@@ -12,7 +12,9 @@ from typing import TYPE_CHECKING
 
 from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
+from claude_code_assist.commentary import transcript
 from claude_code_assist.commentary.prompts import (
+    RECENT_COMMENTS_MAX,
     build_event_prompt,
     build_idle_prompt,
     build_reply_prompt,
@@ -101,6 +103,7 @@ def shutdown_executor() -> None:
     finishes the kill.
     """
     _executor.shutdown(wait=False, cancel_futures=True)
+
 
 # Common preamble patterns models produce despite instructions not to
 _PREAMBLE_RE = re.compile(
@@ -219,13 +222,14 @@ def _generate_text_gemini(system_prompt: str, user_prompt: str, model: str, api_
         return None
 
 
-def _call_llm(system_prompt: str, user_prompt: str, config: CompanionConfig) -> str | None:
+def _call_llm(system_prompt: str, user_prompt: str, config: CompanionConfig, *, kind: str) -> str | None:
     """Route text generation to the configured provider.
 
     Args:
         system_prompt: System prompt for the model.
         user_prompt: User prompt for the model.
         config: Application configuration (determines provider and model).
+        kind: Tag recorded in the prompt transcript (``event`` / ``idle`` / ``reply``).
 
     Returns:
         Result text, or None if generation failed.
@@ -235,19 +239,40 @@ def _call_llm(system_prompt: str, user_prompt: str, config: CompanionConfig) -> 
 
     resolved = config.resolved_commentary_provider
 
+    response: str | None
     if resolved.uses_agent_sdk:
-        return asyncio.run(_generate_text_claude(system_prompt, user_prompt, resolved.model))
-    if resolved.is_openai_compat:
-        return generate_text_openai_compat(system_prompt, user_prompt, resolved)
-    if resolved.provider == LLMProvider.GEMINI:
+        response = asyncio.run(_generate_text_claude(system_prompt, user_prompt, resolved.model))
+    elif resolved.is_openai_compat:
+        response = generate_text_openai_compat(system_prompt, user_prompt, resolved)
+    elif resolved.provider == LLMProvider.GEMINI:
         api_key = resolved.api_key
         if not api_key:
             logger.warning("Gemini API key not set (expected env var: %s)", resolved.api_key_env)
-            return None
-        return _generate_text_gemini(system_prompt, user_prompt, resolved.model, api_key)
+            response = None
+        else:
+            response = _generate_text_gemini(system_prompt, user_prompt, resolved.model, api_key)
+    else:
+        logger.warning("Unsupported commentary provider: %s", resolved.provider)
+        response = None
 
-    logger.warning("Unsupported commentary provider: %s", resolved.provider)
-    return None
+    transcript.log_call(
+        kind=kind,
+        system=system_prompt,
+        user=user_prompt,
+        response=response,
+        provider=resolved.provider.value,
+        model=resolved.model,
+    )
+    return response
+
+
+def _recent_comments_for(companion: CompanionProfile) -> list[str]:
+    """Last few comments the companion has produced, oldest first.
+
+    Surfaced in every user prompt so the LLM can avoid repeating
+    itself across consecutive calls.
+    """
+    return list(companion.comment_history[-RECENT_COMMENTS_MAX:])
 
 
 def _run_generate_comment(
@@ -255,14 +280,19 @@ def _run_generate_comment(
     event: SessionEvent,
     config: CompanionConfig,
     max_length: int,
-    last_user_event: SessionEvent | None,
+    recent_events: list[SessionEvent],
 ) -> str | None:
     """Blocking worker — runs in a background thread."""
     try:
         raw = _call_llm(
             system_prompt=build_system_prompt(companion, max_comment_length=max_length),
-            user_prompt=build_event_prompt(event, last_user_event=last_user_event),
+            user_prompt=build_event_prompt(
+                event,
+                recent_events=recent_events,
+                recent_comments=_recent_comments_for(companion),
+            ),
             config=config,
+            kind="event",
         )
         return _clean_comment(raw, max_length) if raw else None
     except (RuntimeError, asyncio.CancelledError, OSError):
@@ -275,8 +305,12 @@ def _run_generate_idle_chatter(companion: CompanionProfile, config: CompanionCon
     try:
         raw = _call_llm(
             system_prompt=build_system_prompt(companion, max_comment_length=max_length),
-            user_prompt=build_idle_prompt(max_length=max_length),
+            user_prompt=build_idle_prompt(
+                recent_comments=_recent_comments_for(companion),
+                max_length=max_length,
+            ),
             config=config,
+            kind="idle",
         )
         return _clean_comment(raw, max_length) if raw else None
     except (RuntimeError, asyncio.CancelledError, OSError):
@@ -289,7 +323,7 @@ def generate_comment(
     event: SessionEvent,
     config: CompanionConfig,
     max_length: int = 150,
-    last_user_event: SessionEvent | None = None,
+    recent_events: list[SessionEvent] | None = None,
 ) -> str | None:
     """Generate an in-character comment for a session event (blocking).
 
@@ -300,12 +334,14 @@ def generate_comment(
         event: The session event to comment on.
         config: Application configuration.
         max_length: Maximum comment character length.
-        last_user_event: The most recent user event for context (used with assistant events).
+        recent_events: Prior session turns (oldest first) to surface as
+            context. Used in place of the older single
+            ``last_user_event`` shortcut.
 
     Returns:
         Generated comment string, or None if generation failed.
     """
-    return _run_generate_comment(companion, event, config, max_length, last_user_event)
+    return _run_generate_comment(companion, event, config, max_length, list(recent_events or []))
 
 
 def generate_idle_chatter(companion: CompanionProfile, config: CompanionConfig, max_length: int = 100) -> str | None:
@@ -329,7 +365,7 @@ def submit_comment(
     event: SessionEvent,
     config: CompanionConfig,
     max_length: int = 150,
-    last_user_event: SessionEvent | None = None,
+    recent_events: list[SessionEvent] | None = None,
 ) -> Future[str | None]:
     """Submit a comment-generation task to the background executor.
 
@@ -342,12 +378,20 @@ def submit_comment(
         event: The session event to comment on.
         config: Application configuration.
         max_length: Maximum comment character length.
-        last_user_event: Most recent user event for context.
+        recent_events: Prior session turns (oldest first) to thread
+            into the user prompt as context.
 
     Returns:
         Future resolving to the comment string, or None.
     """
-    return _executor.submit(_run_generate_comment, companion, event, config, max_length, last_user_event)
+    return _executor.submit(
+        _run_generate_comment,
+        companion,
+        event,
+        config,
+        max_length,
+        list(recent_events or []),
+    )
 
 
 def _run_generate_reply(
@@ -355,13 +399,21 @@ def _run_generate_reply(
     message: str,
     config: CompanionConfig,
     max_length: int,
+    recent_events: list[SessionEvent],
 ) -> str | None:
     """Generate an in-character reply to a direct address."""
     try:
         raw = _call_llm(
             system_prompt=build_system_prompt(companion, max_comment_length=max_length),
-            user_prompt=build_reply_prompt(companion, message, max_length=max_length),
+            user_prompt=build_reply_prompt(
+                companion,
+                message,
+                recent_events=recent_events,
+                recent_comments=_recent_comments_for(companion),
+                max_length=max_length,
+            ),
             config=config,
+            kind="reply",
         )
         return _clean_comment(raw, max_length) if raw else None
     except (RuntimeError, asyncio.CancelledError, OSError):
@@ -374,9 +426,17 @@ def submit_reply(
     message: str,
     config: CompanionConfig,
     max_length: int = 200,
+    recent_events: list[SessionEvent] | None = None,
 ) -> Future[str | None]:
     """Submit a direct-reply task to the background executor."""
-    return _executor.submit(_run_generate_reply, companion, message, config, max_length)
+    return _executor.submit(
+        _run_generate_reply,
+        companion,
+        message,
+        config,
+        max_length,
+        list(recent_events or []),
+    )
 
 
 def submit_idle_chatter(

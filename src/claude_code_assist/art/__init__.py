@@ -12,9 +12,21 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from claude_code_assist.art.generator import generate_frames, split_and_clean
-    from claude_code_assist.art.placeholder import prefill_placeholder_frames
+    from claude_code_assist.art.premade import (
+        PremadeOption,
+        copy_premade,
+        list_premade_options,
+        match_premade,
+    )
 
-__all__ = ["generate_frames", "prefill_placeholder_frames", "split_and_clean"]
+__all__ = [
+    "PremadeOption",
+    "copy_premade",
+    "generate_frames",
+    "list_premade_options",
+    "match_premade",
+    "split_and_clean",
+]
 
 
 def __getattr__(name: str) -> Any:
@@ -26,8 +38,8 @@ def __getattr__(name: str) -> Any:
         from claude_code_assist.art.generator import split_and_clean
 
         return split_and_clean
-    if name == "prefill_placeholder_frames":
-        from claude_code_assist.art.placeholder import prefill_placeholder_frames
+    if name in {"PremadeOption", "copy_premade", "list_premade_options", "match_premade"}:
+        from claude_code_assist.art import premade
 
-        return prefill_placeholder_frames
+        return getattr(premade, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

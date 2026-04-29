@@ -93,7 +93,6 @@ class CompanionController:
         self._drag_offset_x: float = 0.0
         self._drag_offset_y: float = 0.0
 
-
     # ------------------------------------------------------------------
     # Public read-state
     # ------------------------------------------------------------------
@@ -177,6 +176,19 @@ class CompanionController:
         if self._state != _State.SLEEPING:
             self._awake_frames = max(0, self._awake_frames - 1)
 
+        # Toggling gravity on while the sprite is parked mid-air (e.g. the
+        # user disabled gravity, dragged it up, dropped it, then re-enabled
+        # gravity) should drop it. DRAGGING / FALLING / LANDED already own
+        # their own physics, so leave them alone.
+        if (
+            self.gravity_enabled
+            and self._state in (_State.IDLE, _State.WALKING, _State.REACTING, _State.SLEEPING)
+            and self._y < self._screen.bottom() - self.sprite_height
+        ):
+            self._state = _State.FALLING
+            self._state_frames = 0
+            self._vy = 0.0
+
         if self._state == _State.IDLE:
             return self._tick_idle()
         if self._state == _State.WALKING:
@@ -258,26 +270,23 @@ class CompanionController:
             self._y = floor
             stunned = abs(self._vy) >= _STUN_VELOCITY
             self._vy = 0.0
-            self._state = _State.LANDED
             self._state_frames = 0
-            self._stunned_landing = stunned
-            return F_STUNNED if stunned else F_FALL
+            if stunned:
+                self._state = _State.LANDED
+                return F_STUNNED
+            # Soft landing — there's no dedicated frame between F_FALL
+            # and idle, so skip LANDED entirely instead of holding the
+            # airborne pose on the ground for ~250 ms.
+            self._state = _State.IDLE
+            return F_IDLE_A
         return F_FALL
 
     def _tick_landed(self) -> int:
-        if getattr(self, "_stunned_landing", False):
-            if self._state_frames >= _STUN_FRAMES:
-                self._state = _State.IDLE
-                self._state_frames = 0
-                self._stunned_landing = False
-                return F_IDLE_A
-            return F_STUNNED
-        # Brief landing pose then back to idle
-        if self._state_frames >= _TICK_HZ // 4:
+        if self._state_frames >= _STUN_FRAMES:
             self._state = _State.IDLE
             self._state_frames = 0
             return F_IDLE_A
-        return F_FALL
+        return F_STUNNED
 
     def _tick_reacting(self) -> int:
         if self._state_frames >= _REACT_FRAMES:

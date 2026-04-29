@@ -10,7 +10,7 @@ Layout (current):
                 profile.json
                 art/
                     frame_{0..9}.png
-                    icon_64.png
+                    icon.png
                     sprite.png
                     prompt.txt
                     meta.json
@@ -172,13 +172,27 @@ def get_active_slot(config_dir: Path) -> str | None:
 
 
 def set_active_slot(config_dir: Path, slot: str | None) -> None:
-    """Persist ``active_companion`` in ``config.json``."""
+    """Persist ``active_companion`` in ``config.json``.
+
+    Activating a slot also stamps ``profile.last_activated_at`` so the
+    roster picker can sort by recency-of-use. Best-effort: a missing
+    or unreadable profile silently skips the stamp.
+    """
     data = _read_config_raw(config_dir)
     if slot is None:
         data.pop("active_companion", None)
     else:
         data["active_companion"] = slot
     _write_config_raw(config_dir, data)
+
+    if slot is None:
+        return
+    profile_path = companion_path(config_dir, slot) / PROFILE_FILENAME
+    profile = load_profile(profile_path)
+    if profile is None:
+        return
+    profile.last_activated_at = datetime.now(UTC)
+    save_profile(profile, profile_path)
 
 
 def get_active_companion_dir(config_dir: Path) -> Path | None:
@@ -305,7 +319,39 @@ def migrate_legacy_layout(config_dir: Path) -> bool:
     if _migrate_config_to_json(config_dir):
         moved = True
 
+    if _migrate_icon_filename(config_dir):
+        moved = True
+
     return moved
+
+
+def _migrate_icon_filename(config_dir: Path) -> bool:
+    """Rename ``icon_64.png`` → ``icon.png`` across all roster art and archive dirs."""
+    roster_root = roster_dir(config_dir)
+    if not roster_root.is_dir():
+        return False
+    renamed = False
+    for slot_dir in roster_root.iterdir():
+        if not slot_dir.is_dir():
+            continue
+        candidates = [slot_dir / ART_DIR_NAME]
+        archive_root = slot_dir / ART_ARCHIVE_DIR_NAME
+        if archive_root.is_dir():
+            candidates.extend(p for p in archive_root.iterdir() if p.is_dir())
+        for art_path in candidates:
+            legacy = art_path / "icon_64.png"
+            if not legacy.is_file():
+                continue
+            target = art_path / "icon.png"
+            if target.exists():
+                continue
+            try:
+                legacy.rename(target)
+            except OSError:
+                logger.exception("Could not rename %s → %s", legacy, target)
+                continue
+            renamed = True
+    return renamed
 
 
 def _migrate_to_roster_layout(config_dir: Path) -> bool:

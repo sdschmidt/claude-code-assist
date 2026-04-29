@@ -1,4 +1,4 @@
-"""``companion art`` — generate sprite frames or prefill placeholders.
+"""``companion art`` — generate sprite frames or pick a premade set.
 
 Top-level menu:
 
@@ -10,9 +10,11 @@ Top-level menu:
   * **Adapt** — open four ``questionary.text`` prompts pre-filled with
     those fields so the user can edit (or just hit Enter to accept).
 
-* **Prefill placeholder** — copy the bundled ``assets/placeholder_frames``
-  PNGs into the companion's art dir so the desktop pet can launch
-  immediately, no LLM call.
+* **Premade** — ask the configured profile LLM to match the active
+  companion to one of the bundled ``assets/placeholder_frames/<slug>/``
+  sets (shape > limb count > material > color), then copy that slug's
+  frames + icon + meta.json into the companion's art dir. No image
+  generation, but still one LLM call for the match.
 
 Before either path writes anything, the previous ``companion/art/``
 (if any) is moved to ``companion/art_archive/<ts>/`` via
@@ -35,6 +37,7 @@ from rich.console import Console
 
 from claude_code_assist.art.meta import ArtMeta, load_meta
 from claude_code_assist.art.prompts import LocomotionOverrides
+from claude_code_assist.cli._picker import PICKER_STYLE, bind_shortcuts, menu_title
 from claude_code_assist.profile.storage import (
     PROFILE_FILENAME,
     archive_current_art,
@@ -46,26 +49,34 @@ from claude_code_assist.profile.storage import (
 )
 
 if TYPE_CHECKING:
+    from claude_code_assist.art import PremadeOption
+    from claude_code_assist.config import CompanionConfig
     from claude_code_assist.models.companion import CompanionProfile
 
 logger = logging.getLogger(__name__)
 console = Console()
 
-_TOP_CHOICES_NO_ARCHIVE: tuple[tuple[str, str], ...] = (
-    ("generate", "Generate new — call Gemini with prompts from your profile"),
-    ("prefill", "Prefill placeholder — start with the bundled simple frames"),
+# (value, shortcut, label, description).
+_TOP_CHOICES_NO_ARCHIVE: tuple[tuple[str, str, str, str], ...] = (
+    ("generate", "n", "generate new", "call Gemini with prompts from your profile"),
+    ("premade", "p", "premade", "match a bundled placeholder set to your companion via LLM"),
 )
-_RECROP_CHOICE: tuple[str, str] = (
+_RECROP_CHOICE: tuple[str, str, str, str] = (
     "recrop",
-    "Recrop — re-extract frames from the saved sprite.png with custom options",
+    "e",
+    "recrop",
+    "re-extract frames from the saved sprite with custom options",
 )
-_RESTORE_CHOICE: tuple[str, str] = (
+_RESTORE_CHOICE: tuple[str, str, str, str] = (
     "restore",
-    "Restore — switch back to a previously archived art set",
+    "r",
+    "restore",
+    "switch back to a previously archived art set",
 )
-_GEN_MODE_CHOICES: tuple[tuple[str, str], ...] = (
-    ("auto", "Automatic — use the profile's locomotion descriptors as-is"),
-    ("adapt", "Adapt — review and edit each prompt before generating"),
+_QUIT_CHOICE: tuple[str, str, str, str] = ("quit", "q", "quit", "leave art untouched")
+_GEN_MODE_CHOICES: tuple[tuple[str, str, str, str], ...] = (
+    ("auto", "a", "automatic", "use the profile's locomotion descriptors as-is"),
+    ("adapt", "d", "adapt", "review and edit each prompt before generating"),
 )
 
 
@@ -83,7 +94,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--config-dir",
         type=Path,
         default=None,
-        help="Config directory override. Defaults to $XDG_CONFIG_HOME/claude-code-assist.",
+        help="Config directory override. Defaults to $XDG_CONFIG_HOME/claude-companion.",
     )
     parser.add_argument(
         "--debug",
@@ -96,8 +107,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 def _resolve_config_dir(override: Path | None) -> Path:
     if override is not None:
         return override
-    xdg = os.environ.get("XDG_CONFIG_HOME")
-    return Path(xdg) / "claude-code-assist" if xdg else Path.home() / ".config" / "claude-code-assist"
+    from claude_code_assist.paths import default_config_dir  # noqa: PLC0415
+
+    return default_config_dir()
 
 
 # ---------------------------------------------------------------------------
@@ -107,22 +119,43 @@ def _resolve_config_dir(override: Path | None) -> Path:
 
 def _pick_top_choice(*, allow_recrop: bool, allow_restore: bool) -> str | None:
     """Top-level menu. ``Recrop`` and ``Restore`` only appear when applicable."""
-    pairs: list[tuple[str, str]] = list(_TOP_CHOICES_NO_ARCHIVE)
+    rows: list[tuple[str, str, str, str]] = list(_TOP_CHOICES_NO_ARCHIVE)
     if allow_recrop:
-        pairs.append(_RECROP_CHOICE)
+        rows.append(_RECROP_CHOICE)
     if allow_restore:
-        pairs.append(_RESTORE_CHOICE)
-    choices = [questionary.Choice(title=label, value=value) for value, label in pairs]
+        rows.append(_RESTORE_CHOICE)
+    rows.append(_QUIT_CHOICE)
+    choices = [
+        questionary.Choice(title=menu_title(label, description, shortcut=key), value=value)
+        for value, key, label, description in rows
+    ]
+    shortcut_map = {key: value for value, key, _, _ in rows}
     try:
-        return questionary.select("How do you want to generate art?", choices=choices).ask()
+        question = questionary.select(
+            "How do you want to generate art?",
+            choices=choices,
+            style=PICKER_STYLE,
+        )
+        bind_shortcuts(question, shortcut_map)
+        return question.ask()
     except (KeyboardInterrupt, EOFError):
         return None
 
 
 def _pick_gen_mode() -> str | None:
-    choices = [questionary.Choice(title=label, value=value) for value, label in _GEN_MODE_CHOICES]
+    choices = [
+        questionary.Choice(title=menu_title(label, description, shortcut=key), value=value)
+        for value, key, label, description in _GEN_MODE_CHOICES
+    ]
+    shortcut_map = {key: value for value, key, _, _ in _GEN_MODE_CHOICES}
     try:
-        return questionary.select("Use profile prompts as-is, or edit them first?", choices=choices).ask()
+        question = questionary.select(
+            "Use profile prompts as-is, or edit them first?",
+            choices=choices,
+            style=PICKER_STYLE,
+        )
+        bind_shortcuts(question, shortcut_map)
+        return question.ask()
     except (KeyboardInterrupt, EOFError):
         return None
 
@@ -234,11 +267,54 @@ def _archive_existing(config_dir: Path, slot: str) -> None:
         console.print(f"[dim]Archived previous art set to {archived.name}.[/dim]")
 
 
+# ---------------------------------------------------------------------------
+# Pending-art atomic swap
+# ---------------------------------------------------------------------------
+#
+# Generation / prefill write to a sibling ``art.pending/`` directory and
+# only swap into ``art/`` once the new set is fully on disk. That way
+# Ctrl-C, an API failure, or any other crash leaves the existing
+# ``art/`` and ``art_archive/`` exactly as they were — the old bug was
+# archiving up front and ending up with no usable art when the user
+# cancelled mid-generation.
+
+_PENDING_ART_SUFFIX = ".pending"
+
+
+def _pending_art_dir(art_dir: Path) -> Path:
+    """Return the sibling staging directory used for in-progress art."""
+    return art_dir.parent / f"{art_dir.name}{_PENDING_ART_SUFFIX}"
+
+
+def _discard_pending_art(pending_dir: Path) -> None:
+    """Best-effort cleanup of an in-progress / cancelled art directory."""
+    if pending_dir.exists():
+        shutil.rmtree(pending_dir, ignore_errors=True)
+
+
+def _commit_pending_art(pending_dir: Path, art_dir: Path, config_dir: Path, slot: str) -> None:
+    """Atomically replace ``art_dir`` with ``pending_dir``.
+
+    Archives the existing ``art_dir`` (when non-empty) into the slot's
+    ``art_archive/`` first, then renames ``pending_dir`` into place.
+    The empty-directory branch handles the freshly-created companion
+    case where ``art/`` exists but has no files — ``rename`` would
+    otherwise refuse to overwrite even an empty target.
+    """
+    archived = archive_current_art(config_dir, slot=slot)
+    if archived is not None:
+        console.print(f"[dim]Archived previous art set to {archived.name}.[/dim]")
+    elif art_dir.exists():
+        shutil.rmtree(art_dir)
+    pending_dir.rename(art_dir)
+
+
 _DEPENDENCY_HINT = (
     "Run [bold]uv tool install . --reinstall[/bold] (or "
     "[bold]uv tool upgrade claude-code-assist[/bold]) to refresh the "
     "tool environment with the new dependencies."
 )
+
 
 def _print_active_banner(companion: CompanionProfile) -> None:
     """One-liner identical in shape to a ``companion roster`` entry.
@@ -335,8 +411,7 @@ def _run_restore(config_dir: Path, slot: str) -> int:
         return 0
 
     choices = [
-        questionary.Choice(title=_restore_choice_title(path.name, meta), value=str(path))
-        for path, meta in archives
+        questionary.Choice(title=_restore_choice_title(path.name, meta), value=str(path)) for path, meta in archives
     ]
     try:
         selected = questionary.select("Choose an art set to restore:", choices=choices).ask()
@@ -375,14 +450,38 @@ def _run_generate(
     except ImportError as exc:
         console.print(f"[red]Art generation dependencies are missing:[/red] {exc.name or exc}\n{_DEPENDENCY_HINT}")
         return 1
-    _archive_existing(config_dir, slot)
     art_dir = companion_art_dir(config_dir, slot)
-    with console.status("[cyan]Generating sprite frames with Gemini…[/cyan]", spinner="dots"):
-        try:
-            frames = generate_frames(companion, art_dir, overrides=overrides, api_key=api_key)
-        except (RuntimeError, ValueError) as exc:
-            console.print(f"[red]Generation failed:[/red] {exc}")
-            return 1
+    pending_dir = _pending_art_dir(art_dir)
+    # Wipe a stale staging dir from a previous crashed / killed run so
+    # we don't merge half-baked frames into a fresh attempt.
+    _discard_pending_art(pending_dir)
+
+    from claude_code_assist.qt.settings import SettingsStore  # noqa: PLC0415
+
+    settings = SettingsStore(config_dir).load()
+
+    try:
+        with console.status("[cyan]Generating sprite frames with Gemini…[/cyan]", spinner="dots"):
+            frames = generate_frames(
+                companion,
+                pending_dir,
+                overrides=overrides,
+                api_key=api_key,
+                write_prompt_log=settings.art_prompt_log,
+            )
+    except KeyboardInterrupt:
+        _discard_pending_art(pending_dir)
+        console.print("[yellow]Generation cancelled. Existing art is unchanged.[/yellow]")
+        return 130
+    except (RuntimeError, ValueError) as exc:
+        _discard_pending_art(pending_dir)
+        console.print(f"[red]Generation failed:[/red] {exc}")
+        return 1
+    except Exception:
+        _discard_pending_art(pending_dir)
+        raise
+
+    _commit_pending_art(pending_dir, art_dir, config_dir, slot)
     console.print(f"[green]Saved {len(frames)} frames to {art_dir}.[/green]")
     console.print("Run [bold]companion[/bold] to start the companion.")
     return 0
@@ -395,6 +494,27 @@ def _ask_yes_no(message: str, *, default: bool) -> bool | None:
     except (KeyboardInterrupt, EOFError):
         return None
     return answer
+
+
+def _ask_int(message: str, *, default: int, minimum: int = 0, maximum: int = 32) -> int | None:
+    """Prompt for a non-negative int. Returns ``None`` on cancel."""
+
+    def _validate(raw: str) -> bool | str:
+        try:
+            value = int(raw)
+        except ValueError:
+            return "Enter a whole number."
+        if value < minimum or value > maximum:
+            return f"Must be between {minimum} and {maximum}."
+        return True
+
+    try:
+        answer = questionary.text(message, default=str(default), validate=_validate).ask()
+    except (KeyboardInterrupt, EOFError):
+        return None
+    if answer is None:
+        return None
+    return int(answer)
 
 
 def _run_recrop(config_dir: Path, slot: str) -> int:
@@ -418,8 +538,7 @@ def _run_recrop(config_dir: Path, slot: str) -> int:
             if archive_sprite.is_file():
                 sprite_path = archive_sprite
                 console.print(
-                    f"[dim]Using sprite.png from archive {archive_path.name} "
-                    f"(no current art/sprite.png).[/dim]"
+                    f"[dim]Using sprite.png from archive {archive_path.name} (no current art/sprite.png).[/dim]"
                 )
                 break
         else:
@@ -434,18 +553,24 @@ def _run_recrop(config_dir: Path, slot: str) -> int:
         console.print("[yellow]Cancelled.[/yellow]")
         return 0
     smart_split = _ask_yes_no(
-        "Smart-find frames (detect cell boundaries from grid lines)?",
-        default=False,
+        "Smart-find frames (detect cell boundaries from magenta corridors)?",
+        default=True,
     )
     if smart_split is None:
         console.print("[yellow]Cancelled.[/yellow]")
         return 0
     contiguous_chroma = _ask_yes_no(
-        "Background flood-fill: contiguous-only? "
-        "(yes = preserve interior chroma; no = also clear enclosed pockets)",
-        default=True,
+        "Background flood-fill: contiguous-only? (yes = preserve interior chroma; no = also clear enclosed pockets)",
+        default=False,
     )
     if contiguous_chroma is None:
+        console.print("[yellow]Cancelled.[/yellow]")
+        return 0
+    feather_px = _ask_int(
+        "Feather edge (pixels of inward alpha ramp to kill magenta halo; 0 disables)",
+        default=2,
+    )
+    if feather_px is None:
         console.print("[yellow]Cancelled.[/yellow]")
         return 0
 
@@ -474,6 +599,7 @@ def _run_recrop(config_dir: Path, slot: str) -> int:
             remove_grid=remove_grid,
             smart_split=smart_split,
             contiguous_chroma=contiguous_chroma,
+            feather_px=feather_px,
         )
     except RuntimeError as exc:
         console.print(f"[red]Recrop failed:[/red] {exc}")
@@ -482,24 +608,115 @@ def _run_recrop(config_dir: Path, slot: str) -> int:
     console.print(
         f"[green]Re-cropped {len(frames)} frames into {art_dir}.[/green]  "
         f"[dim](remove_grid={remove_grid}, smart={smart_split}, "
-        f"contiguous={contiguous_chroma})[/dim]"
+        f"contiguous={contiguous_chroma}, feather={feather_px}px)[/dim]"
     )
     console.print("Run [bold]companion[/bold] to start the companion.")
     return 0
 
 
-def _run_prefill(config_dir: Path, slot: str) -> int:
+def _load_companion_config(config_dir: Path) -> CompanionConfig:
+    """Load ``config.json`` for LLM provider settings, defaulting to a fresh config."""
+    from claude_code_assist.config import CompanionConfig as _Config  # noqa: PLC0415
+    from claude_code_assist.config import load_config  # noqa: PLC0415
+
+    cfg_path = config_dir / "config.json"
+    if cfg_path.is_file():
+        return load_config(cfg_path).model_copy(update={"config_dir": config_dir})
+    return _Config(config_dir=config_dir)
+
+
+def _pick_premade_manually(
+    options: tuple[PremadeOption, ...], default_slug: str
+) -> PremadeOption | None:
+    """Manual override picker — used when the user rejects the LLM match."""
+    choices = [
+        questionary.Choice(
+            title=f"{opt.slug}  —  {opt.description[:80]}",
+            value=opt.slug,
+        )
+        for opt in options
+    ]
     try:
-        from claude_code_assist.art import prefill_placeholder_frames
+        slug = questionary.select(
+            "Pick a premade set:",
+            choices=choices,
+            default=default_slug,
+            style=PICKER_STYLE,
+        ).ask()
+    except (KeyboardInterrupt, EOFError):
+        return None
+    if slug is None:
+        return None
+    return next((o for o in options if o.slug == slug), None)
+
+
+def _run_premade(config_dir: Path, slot: str, companion: CompanionProfile) -> int:
+    try:
+        from claude_code_assist.art import (  # noqa: PLC0415
+            copy_premade,
+            list_premade_options,
+            match_premade,
+        )
     except ImportError as exc:
         console.print(
-            f"[red]Placeholder copy needs a dependency that's missing:[/red] {exc.name or exc}\n{_DEPENDENCY_HINT}"
+            f"[red]Premade copy needs a dependency that's missing:[/red] {exc.name or exc}\n{_DEPENDENCY_HINT}"
         )
         return 1
-    _archive_existing(config_dir, slot)
+
+    options = list_premade_options()
+    if not options:
+        console.print("[red]No premade art sets are bundled.[/red]")
+        return 1
+
+    cfg = _load_companion_config(config_dir)
+
+    try:
+        with console.status("[cyan]Matching profile to premade art…[/cyan]", spinner="dots"):
+            chosen, reason = match_premade(companion, options, cfg)
+    except KeyboardInterrupt:
+        console.print("[yellow]Match cancelled. Existing art is unchanged.[/yellow]")
+        return 130
+    except RuntimeError as exc:
+        console.print(f"[yellow]Matcher failed:[/yellow] {exc}")
+        chosen = options[0]
+        reason = f"(LLM match failed; falling back to {options[0].slug})"
+
+    console.print(f"[bold green]Match:[/bold green] {chosen.slug}")
+    if reason:
+        console.print(f"[dim]{reason}[/dim]")
+
+    use_match = _ask_yes_no("Use this premade set?", default=True)
+    if use_match is None:
+        console.print("[yellow]Cancelled.[/yellow]")
+        return 0
+    if not use_match:
+        manual = _pick_premade_manually(options, chosen.slug)
+        if manual is None:
+            console.print("[yellow]Cancelled.[/yellow]")
+            return 0
+        chosen = manual
+        console.print(f"[bold green]Selected:[/bold green] {chosen.slug}")
+
     art_dir = companion_art_dir(config_dir, slot)
-    paths = prefill_placeholder_frames(art_dir)
-    console.print(f"[green]Prefilled {len(paths)} placeholder frames in {art_dir}.[/green]")
+    pending_dir = _pending_art_dir(art_dir)
+    _discard_pending_art(pending_dir)
+
+    try:
+        paths = copy_premade(chosen, pending_dir)
+    except KeyboardInterrupt:
+        _discard_pending_art(pending_dir)
+        console.print("[yellow]Copy cancelled. Existing art is unchanged.[/yellow]")
+        return 130
+    except (RuntimeError, OSError) as exc:
+        _discard_pending_art(pending_dir)
+        console.print(f"[red]Copy failed:[/red] {exc}")
+        return 1
+    except Exception:
+        _discard_pending_art(pending_dir)
+        raise
+
+    _commit_pending_art(pending_dir, art_dir, config_dir, slot)
+    console.print(f"[green]Copied {len(paths)} frames from premade {chosen.slug!r}.[/green]")
     console.print(
         "Run [bold]companion[/bold] to start the companion, or [bold]companion art[/bold] "
         "again to swap in real Gemini frames later."
@@ -547,12 +764,12 @@ def run(argv: list[str]) -> int:
     has_archives = bool(_list_art_archives(config_dir, slot))
     has_sprite = _has_sprite_source(config_dir, slot)
     top = _pick_top_choice(allow_recrop=has_sprite, allow_restore=has_archives)
-    if top is None:
+    if top is None or top == "quit":
         console.print("[yellow]Cancelled.[/yellow]")
         return 0
 
-    if top == "prefill":
-        return _run_prefill(config_dir, slot)
+    if top == "premade":
+        return _run_premade(config_dir, slot, companion)
 
     if top == "restore":
         return _run_restore(config_dir, slot)

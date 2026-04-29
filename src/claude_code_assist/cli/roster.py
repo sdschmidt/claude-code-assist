@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +18,7 @@ from typing import TYPE_CHECKING
 import questionary
 from rich.console import Console
 
+from claude_code_assist.cli._picker import PICKER_STYLE, bind_shortcuts, menu_title
 from claude_code_assist.profile.storage import (
     PROFILE_FILENAME,
     get_active_slot,
@@ -49,6 +49,7 @@ class _RosterEntry:
     role: Role | None
     level: int
     created_at: datetime | None
+    last_activated_at: datetime | None
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +66,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--config-dir",
         type=Path,
         default=None,
-        help="Config directory override. Defaults to $XDG_CONFIG_HOME/claude-code-assist.",
+        help="Config directory override. Defaults to $XDG_CONFIG_HOME/claude-companion.",
     )
     parser.add_argument(
         "--debug",
@@ -78,8 +79,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 def _resolve_config_dir(override: Path | None) -> Path:
     if override is not None:
         return override
-    xdg = os.environ.get("XDG_CONFIG_HOME")
-    return Path(xdg) / "claude-code-assist" if xdg else Path.home() / ".config" / "claude-code-assist"
+    from claude_code_assist.paths import default_config_dir  # noqa: PLC0415
+
+    return default_config_dir()
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +115,7 @@ def _scan_roster(config_dir: Path) -> list[_RosterEntry]:
             role: Role | None = profile.role
             level = profile.level
             created = profile.created_at
+            last_activated = profile.last_activated_at
         else:
             display_name = slot_dir.name
             creature_type = ""
@@ -120,6 +123,7 @@ def _scan_roster(config_dir: Path) -> list[_RosterEntry]:
             role = None
             level = 1
             created = datetime.fromtimestamp(slot_dir.stat().st_mtime).astimezone()
+            last_activated = None
         entries.append(
             _RosterEntry(
                 slot=slot_dir.name,
@@ -131,6 +135,7 @@ def _scan_roster(config_dir: Path) -> list[_RosterEntry]:
                 role=role,
                 level=level,
                 created_at=created,
+                last_activated_at=last_activated,
             )
         )
 
@@ -187,16 +192,55 @@ def _format_choice_title(entry: _RosterEntry) -> list[tuple[str, str]]:
     return parts
 
 
+_QUIT_SENTINEL = "__quit__"
+_RECENT_COUNT = 5
+
+
+def _last_used(entry: _RosterEntry) -> float:
+    """Sort key for the recents section: prefer ``last_activated_at``,
+    fall back to ``created_at`` for legacy profiles, else ``0`` so they
+    sink to the bottom rather than disappearing.
+    """
+    ref = entry.last_activated_at or entry.created_at
+    return ref.timestamp() if ref is not None else 0.0
+
+
 def _pick_companion(entries: list[_RosterEntry]) -> _RosterEntry | None:
-    choices = [questionary.Choice(title=_format_choice_title(e), value=e.slot) for e in entries]
+    """Render the picker as: active on top, then ``_RECENT_COUNT`` most
+    recently used, then every companion sorted by name. The all-by-name
+    list intentionally includes the rows already shown above so it stays
+    exhaustive (the user asked for this).
+    """
+    active = next((e for e in entries if e.is_active), None)
+    non_active = [e for e in entries if not e.is_active]
+    recent = sorted(non_active, key=_last_used, reverse=True)[:_RECENT_COUNT]
+    by_name = sorted(entries, key=lambda e: e.display_name.casefold())
+
+    choices: list[questionary.Choice | questionary.Separator] = []
+    if active is not None:
+        choices.append(questionary.Choice(title=_format_choice_title(active), value=active.slot))
+        if recent or by_name:
+            choices.append(questionary.Separator(" "))
+    for entry in recent:
+        choices.append(questionary.Choice(title=_format_choice_title(entry), value=entry.slot))
+    if recent and by_name:
+        choices.append(questionary.Separator(" "))
+    for entry in by_name:
+        choices.append(questionary.Choice(title=_format_choice_title(entry), value=entry.slot))
+    choices.append(
+        questionary.Choice(title=menu_title("quit", "", shortcut="q"), value=_QUIT_SENTINEL)
+    )
     try:
-        selected = questionary.select(
+        question = questionary.select(
             "Choose a companion to activate:",
             choices=choices,
-        ).ask()
+            style=PICKER_STYLE,
+        )
+        bind_shortcuts(question, {"q": _QUIT_SENTINEL})
+        selected = question.ask()
     except (KeyboardInterrupt, EOFError):
         return None
-    if selected is None:
+    if selected is None or selected == _QUIT_SENTINEL:
         return None
     return next((e for e in entries if e.slot == selected), None)
 

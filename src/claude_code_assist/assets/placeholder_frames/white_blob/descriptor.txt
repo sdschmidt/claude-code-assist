@@ -1,0 +1,1 @@
+type blob; anatomy: A translucent gelatinous blob roughly spherical in shape with two stubby appendages that serve as primitive limbs.

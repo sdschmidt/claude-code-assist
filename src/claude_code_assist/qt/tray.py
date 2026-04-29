@@ -32,6 +32,11 @@ from PySide6.QtWidgets import (
 )
 
 from claude_code_assist.models.rarity import Rarity
+from claude_code_assist.profile.leveling import (
+    eligibility_reason,
+    format_xp_bar_segments,
+    is_eligible_for_levelup,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -83,6 +88,11 @@ _RARITY_TIER_LABEL: dict[Rarity, str] = {
     Rarity.LEGENDARY: "Legendary",
 }
 
+# Level-up halo + menu accent. Picked to read as "celebration" against the
+# rarity colors without colliding with any of them.
+_LEVELUP_GLOW_COLOR = "#ffd84d"
+_LEVELUP_MENU_COLOR = "#ffd84d"
+
 
 def install_tray(
     app: QApplication,
@@ -101,75 +111,128 @@ def install_tray(
     on_gravity_toggled: Callable[[bool], None] | None = None,
     on_walking_toggled: Callable[[bool], None] | None = None,
     on_scale_changed: Callable[[float], None] | None = None,
+    on_levelup_requested: Callable[[], None] | None = None,
 ) -> QSystemTrayIcon:
-    """Install the tray icon + full menu.  Caller keeps the returned ref alive.
+    """Install the tray icon + full menu. Caller keeps the returned ref alive.
 
     The toggles call ``on_gravity_toggled`` / ``on_walking_toggled`` so
     the live :class:`CompanionController` updates immediately, then persist
     via ``settings_store`` so the choice survives a relaunch.
+
+    Level-up indicator: when :func:`is_eligible_for_levelup` is true the
+    icon gets a gold halo and a yellow "⬆ Level up available!" entry
+    appears above the header. Eligibility is re-checked on every
+    ``aboutToShow``; after the player completes a level-up the caller
+    must call ``tray.refresh_levelup()`` (attached below) so the icon
+    drops the halo and the menu rebuilds with the new level/stats/rarity.
     """
     if not QSystemTrayIcon.isSystemTrayAvailable():
         # On GNOME without the AppIndicator extension this returns False;
         # the companion still runs, just without a tray entry.
         logger.warning("System tray is not available on this desktop")
 
-    if _TRAY_DEBUG_RED_SQUARE:
-        icon = _build_red_square_icon(save_dir=art_dir)
-    else:
-        icon = _build_tray_icon(icon_pixmap, save_dir=art_dir)
-    tray = QSystemTrayIcon(icon, parent=app)
+    tray = QSystemTrayIcon(parent=app)
     tray.setToolTip(companion.name)
 
     menu = QMenu()
-    _add_header(menu, companion)
-    # Point the "config" row at the active companion's roster directory
-    # rather than the global config dir — opening it gets the user
-    # straight to ``profile.json``, ``art/``, and ``art_archive/`` for
-    # this companion.
-    companion_dir = art_dir.parent
-    _add_info_rows(
-        menu,
-        session=session_label,
-        cwd=cwd_label,
-        config=str(companion_dir),
-        on_cwd_clicked=lambda: _open_path(cwd_path),
-        on_config_clicked=lambda: _open_path(companion_dir),
-    )
-    _add_preview(menu, icon_pixmap)
-    _add_stats(menu, companion)
-    _add_text_block(menu, "Bio", companion.personality)
-    _add_text_block(menu, "Backstory", companion.backstory)
-
-    menu.addSeparator()
-
-    if on_react_now is not None:
-        react_action = QAction("React now", menu)
-        react_action.triggered.connect(on_react_now)
-        menu.addAction(react_action)
-
-    gravity_action = QAction("Gravity", menu)
-    gravity_action.setCheckable(True)
-    gravity_action.setChecked(settings.gravity_enabled)
-    gravity_action.toggled.connect(
-        lambda checked: _persist_gravity(settings, settings_store, on_gravity_toggled, checked)
-    )
-    menu.addAction(gravity_action)
-
-    walk_action = QAction("Walking", menu)
-    walk_action.setCheckable(True)
-    walk_action.setChecked(settings.walking_enabled)
-    walk_action.toggled.connect(lambda checked: _persist_walking(settings, settings_store, on_walking_toggled, checked))
-    menu.addAction(walk_action)
-
-    _add_scale_slider(menu, settings, settings_store, on_scale_changed)
-
-    menu.addSeparator()
-
-    quit_action = QAction(f"Quit {companion.name}", menu)
-    quit_action.triggered.connect(on_quit)
-    menu.addAction(quit_action)
-
     tray.setContextMenu(menu)
+
+    # Mutable holders so the closures below stay synchronized across
+    # rebuilds without leaking object identity into module scope.
+    eligible_state = {"value": is_eligible_for_levelup(companion)}
+    companion_dir = art_dir.parent
+
+    def _set_icon(eligible: bool) -> None:
+        if _TRAY_DEBUG_RED_SQUARE:
+            tray.setIcon(_build_red_square_icon(save_dir=art_dir))
+            return
+        tray.setIcon(_build_tray_icon(icon_pixmap, save_dir=art_dir, levelup_glow=eligible))
+
+    def _populate(eligible: bool) -> None:
+        menu.clear()
+        if eligible and on_levelup_requested is not None:
+            _add_levelup_entry(menu, companion, on_levelup_requested)
+            menu.addSeparator()
+        _add_header(menu, companion)
+        _add_preview(menu, icon_pixmap)
+        _add_stats(menu, companion)
+        _add_text_block(menu, "Bio", companion.personality)
+        _add_text_block(menu, "Backstory", companion.backstory)
+
+        menu.addSeparator()
+
+        # Point the "config" row at the active companion's roster directory
+        # rather than the global config dir — opening it gets the user
+        # straight to ``profile.json``, ``art/``, and ``art_archive/`` for
+        # this companion.
+        _add_info_rows(
+            menu,
+            session=session_label,
+            cwd=cwd_label,
+            config=str(companion_dir),
+            on_cwd_clicked=lambda: _open_path(cwd_path),
+            on_config_clicked=lambda: _open_path(companion_dir),
+        )
+
+        menu.addSeparator()
+
+        if on_react_now is not None:
+            react_action = QAction("React now", menu)
+            react_action.triggered.connect(on_react_now)
+            menu.addAction(react_action)
+
+        gravity_action = QAction("Gravity", menu)
+        gravity_action.setCheckable(True)
+        gravity_action.setChecked(settings.gravity_enabled)
+        gravity_action.toggled.connect(
+            lambda checked: _persist_gravity(settings, settings_store, on_gravity_toggled, checked)
+        )
+        menu.addAction(gravity_action)
+
+        walk_action = QAction("Walking", menu)
+        walk_action.setCheckable(True)
+        walk_action.setChecked(settings.walking_enabled)
+        walk_action.toggled.connect(
+            lambda checked: _persist_walking(settings, settings_store, on_walking_toggled, checked)
+        )
+        menu.addAction(walk_action)
+
+        _add_scale_slider(menu, settings, settings_store, on_scale_changed)
+
+        menu.addSeparator()
+
+        quit_action = QAction(f"Quit {companion.name}", menu)
+        quit_action.triggered.connect(on_quit)
+        menu.addAction(quit_action)
+
+    def _on_about_to_show() -> None:
+        # Cheap re-check: comment_counter ticks up at runtime so a
+        # session that started "not eligible" can become eligible
+        # before the next launch. Only rebuild when the bit actually
+        # flips so right-click → open is fast in the common case.
+        new_eligible = is_eligible_for_levelup(companion)
+        if new_eligible != eligible_state["value"]:
+            eligible_state["value"] = new_eligible
+            _set_icon(new_eligible)
+            _populate(new_eligible)
+
+    def _refresh_levelup() -> None:
+        # Called by the host app after a successful level-up: the
+        # profile has been mutated (new level / stats / rarity) and
+        # the eligibility bit is back to False. Rebuild from scratch
+        # so header colors, stat bars, and tier label all redraw.
+        eligible_state["value"] = is_eligible_for_levelup(companion)
+        _set_icon(eligible_state["value"])
+        _populate(eligible_state["value"])
+
+    _set_icon(eligible_state["value"])
+    _populate(eligible_state["value"])
+    menu.aboutToShow.connect(_on_about_to_show)
+
+    # Stash the refresh hook on the tray so app.py can drive it from
+    # the level-up dialog confirmation without holding a separate ref.
+    tray.refresh_levelup = _refresh_levelup  # type: ignore[attr-defined]
+
     tray.show()
     return tray
 
@@ -183,6 +246,7 @@ def _build_tray_icon(
     icon_pixmap: QPixmap,
     *,
     save_dir: Path | None = None,
+    levelup_glow: bool = False,
 ) -> QIcon:
     """Build a 64×64 tray icon: trim, square-pad, scale, save.
 
@@ -203,8 +267,15 @@ def _build_tray_icon(
        boundaries, so the result is centered both ways and fills the
        slot.
 
-    When ``save_dir`` is given the result is also written to
-    ``<save_dir>/icon_64.png`` for manual inspection.
+    When ``levelup_glow`` is true, a soft gold halo is composited
+    behind the sprite via :func:`_apply_levelup_halo` so the user sees
+    a "level up available" cue right in the menu bar. The glow is
+    composed entirely in memory and is *not* persisted — it flips on
+    and off whenever eligibility changes, so caching it on disk would
+    just produce stale files.
+
+    When ``save_dir`` is given the base (no-glow) rendition is written
+    to ``<save_dir>/icon.png`` for manual inspection.
     """
     trimmed = _trim_to_visible(icon_pixmap)
     # ``_square_pad`` and ``QPixmap.scaled`` both reach for raw pixel
@@ -223,17 +294,139 @@ def _build_tray_icon(
         Qt.TransformationMode.SmoothTransformation,
     )
     rendition.setDevicePixelRatio(1.0)
-    if save_dir is not None:
-        out = save_dir / f"icon_{_TRAY_ICON_SIZE}.png"
+    if save_dir is not None and not levelup_glow:
+        out = save_dir / "icon.png"
         try:
             save_dir.mkdir(parents=True, exist_ok=True)
             if not rendition.save(str(out), "PNG"):
                 logger.warning("Failed to write tray icon to %s", out)
         except OSError:
             logger.exception("Could not save tray icon to %s", out)
+    if levelup_glow:
+        rendition = _apply_levelup_halo(rendition)
     icon = QIcon()
     icon.addPixmap(rendition)
     return icon
+
+
+_HALO_MARGIN = 9  # pixels of inset around the sprite to host the halo
+_HALO_OFFSETS: tuple[tuple[int, int, float], ...] = (
+    # Inner ring (r=3) — drives perceived brightness right at the edge.
+    (-3, 0, 0.65),
+    (3, 0, 0.65),
+    (0, -3, 0.65),
+    (0, 3, 0.65),
+    (-2, -2, 0.55),
+    (2, -2, 0.55),
+    (-2, 2, 0.55),
+    (2, 2, 0.55),
+    # Mid ring (r=5).
+    (-5, 0, 0.45),
+    (5, 0, 0.45),
+    (0, -5, 0.45),
+    (0, 5, 0.45),
+    (-4, -3, 0.40),
+    (4, -3, 0.40),
+    (-4, 3, 0.40),
+    (4, 3, 0.40),
+    (-3, -4, 0.40),
+    (3, -4, 0.40),
+    (-3, 4, 0.40),
+    (3, 4, 0.40),
+    # Outer ring (r=8) — fades into the menu bar background.
+    (-8, 0, 0.28),
+    (8, 0, 0.28),
+    (0, -8, 0.28),
+    (0, 8, 0.28),
+    (-6, -5, 0.25),
+    (6, -5, 0.25),
+    (-6, 5, 0.25),
+    (6, 5, 0.25),
+    (-5, -6, 0.25),
+    (5, -6, 0.25),
+    (-5, 6, 0.25),
+    (5, 6, 0.25),
+    # Centered fills bump the body brightness so the halo reads as a
+    # surrounding glow rather than an offset shadow.
+    (0, 0, 0.45),
+    (0, 0, 0.45),
+)
+
+
+def _apply_levelup_halo(sprite: QPixmap) -> QPixmap:
+    """Composite a soft gold halo behind ``sprite`` and return a new pixmap.
+
+    Implemented without ``QGraphicsBlurEffect`` (which needs a
+    ``QGraphicsScene`` round-trip and produces inconsistent output
+    across platforms) by:
+
+    1. Shrinking the sprite to leave :data:`_HALO_MARGIN` px of breathing
+       room on every side — without this the outer halo offsets hit
+       the canvas edges and the halo only shows on whichever side the
+       sprite happens to leave room.
+    2. Building an alpha-only "silhouette" of the shrunken sprite
+       tinted with :data:`_LEVELUP_GLOW_COLOR`.
+    3. Stamping that silhouette at the offsets in :data:`_HALO_OFFSETS`
+       with descending alpha, so the union reads as a soft halo rather
+       than a hard outline.
+    4. Drawing the shrunken sprite on top so the foreground stays crisp.
+
+    Output is the same size as the input so callers can swap pixmaps
+    transparently. The companion appears slightly smaller while the
+    halo is on, which matches the "look at me!" affordance.
+    """
+    from PySide6.QtGui import QPainter
+
+    width, height = sprite.width(), sprite.height()
+    canvas = QPixmap(width, height)
+    canvas.fill(Qt.GlobalColor.transparent)
+    canvas.setDevicePixelRatio(sprite.devicePixelRatio())
+
+    inner_w = max(1, width - 2 * _HALO_MARGIN)
+    inner_h = max(1, height - 2 * _HALO_MARGIN)
+    inner = sprite.scaled(
+        inner_w,
+        inner_h,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    inner.setDevicePixelRatio(sprite.devicePixelRatio())
+    inset_x = (width - inner.width()) // 2
+    inset_y = (height - inner.height()) // 2
+
+    silhouette = _tint_silhouette(inner, QColor(_LEVELUP_GLOW_COLOR))
+
+    painter = QPainter(canvas)
+    for dx, dy, alpha in _HALO_OFFSETS:
+        painter.setOpacity(alpha)
+        painter.drawPixmap(inset_x + dx, inset_y + dy, silhouette)
+    painter.setOpacity(1.0)
+    painter.drawPixmap(inset_x, inset_y, inner)
+    painter.end()
+    return canvas
+
+
+def _tint_silhouette(pixmap: QPixmap, color: QColor) -> QPixmap:
+    """Return ``pixmap`` with every opaque pixel replaced by ``color``.
+
+    Alpha is preserved so the result is a colored silhouette of the
+    source. Used as the building block for the level-up halo.
+    """
+    from PySide6.QtGui import QPainter
+
+    silhouette = QPixmap(pixmap.size())
+    silhouette.fill(Qt.GlobalColor.transparent)
+    silhouette.setDevicePixelRatio(pixmap.devicePixelRatio())
+
+    painter = QPainter(silhouette)
+    painter.drawPixmap(0, 0, pixmap)
+    # SourceIn keeps only the pixels that overlap the existing alpha,
+    # so filling with ``color`` recolors the silhouette without
+    # bleeding into the transparent surround.
+    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+    painter.fillRect(silhouette.rect(), color)
+    painter.end()
+    return silhouette
 
 
 def _build_red_square_icon(*, save_dir: Path) -> QIcon:
@@ -281,6 +474,53 @@ def _square_pad(pixmap: QPixmap) -> QPixmap:
     return canvas
 
 
+def _add_levelup_entry(
+    menu: QMenu,
+    companion: CompanionProfile,
+    on_clicked: Callable[[], None],
+) -> None:
+    """Plain QAction that sits above the header when a level-up is available.
+
+    Using a regular ``QAction`` (rather than the ``QWidgetAction`` we
+    use elsewhere for richly-styled rows) buys us the menu's native
+    hover highlight and click chrome on every platform — the same
+    feel as "React now" or the cwd row. Qt stylesheets are ignored on
+    macOS native menus, so the yellow cue is carried by a filled
+    yellow dot icon plus a bold font weight.
+    """
+    label = f"⬆ Level up available!  ·  {eligibility_reason(companion)}"
+    action = QAction(_build_levelup_dot_icon(), label, menu)
+    font = action.font()
+    font.setBold(True)
+    action.setFont(font)
+    action.triggered.connect(on_clicked)
+    menu.addAction(action)
+
+
+def _build_levelup_dot_icon() -> QIcon:
+    """Small filled yellow circle used as the level-up menu icon.
+
+    Drawn at 16×16 on a transparent canvas; the OS scales it to fit
+    whatever icon slot the native menu uses. Color matches
+    :data:`_LEVELUP_MENU_COLOR` so the dot, the icon halo, and any
+    other future level-up affordances all share one accent.
+    """
+    from PySide6.QtGui import QPainter
+
+    size = 16
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    try:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(QColor(_LEVELUP_MENU_COLOR))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(2, 2, size - 4, size - 4)
+    finally:
+        painter.end()
+    return QIcon(pixmap)
+
+
 def _add_header(menu: QMenu, companion: CompanionProfile) -> None:
     """Bold companion name (rarity-colored) + stars + tier label.
 
@@ -304,23 +544,17 @@ def _add_header(menu: QMenu, companion: CompanionProfile) -> None:
     row2_segments: list[str] = []
     if companion.creature_type:
         row2_segments.append(
-            f'<span style="color:#aaa; font-size:12px;">'
-            f"{_html_escape(companion.creature_type)}"
-            f"</span>"
+            f'<span style="color:#aaa; font-size:12px;">{_html_escape(companion.creature_type)}</span>'
         )
     if companion.role is not None:
         defn = ROLE_CATALOG.get(companion.role)
         role_color = defn.color if defn else "#aaa"
         row2_segments.append(
-            f'<span style="color:{role_color}; font-size:12px;">'
-            f"{_html_escape(companion.role.value)}"
-            f"</span>"
+            f'<span style="color:{role_color}; font-size:12px;">{_html_escape(companion.role.value)}</span>'
         )
     row2_html = ""
     if row2_segments:
-        joined = (
-            '<span style="color:#666; font-size:12px;"> · </span>'.join(row2_segments)
-        )
+        joined = '<span style="color:#666; font-size:12px;"> · </span>'.join(row2_segments)
         row2_html = f"<br>{joined}"
 
     label.setText(
@@ -333,6 +567,22 @@ def _add_header(menu: QMenu, companion: CompanionProfile) -> None:
         f"{row2_html}"
     )
     layout.addWidget(label)
+
+    # XP bar — same block characters as the per-stat bars, rarity-colored
+    # fill, no numeric value (the user explicitly asked for the bar
+    # alone). A separate ``QLabel`` so the monospace font lands cleanly;
+    # the rest of the header runs in the menu's proportional font.
+    xp_filled, xp_empty = format_xp_bar_segments(companion.comment_counter)
+    xp_label = QLabel()
+    xp_label.setFont(_monospace_font())
+    xp_label.setTextFormat(Qt.TextFormat.RichText)
+    xp_label.setText(
+        f'<span style="color:#888;">XP&nbsp;</span>'
+        f'<span style="color:{color};">{xp_filled}</span>'
+        f'<span style="color:#444;">{xp_empty}</span>'
+    )
+    layout.addWidget(xp_label)
+
     _add_widget(menu, container, enabled=False)
 
 

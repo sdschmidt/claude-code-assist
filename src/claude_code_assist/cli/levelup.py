@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 from pathlib import Path
 
 from rich.console import Console
@@ -39,7 +38,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--config-dir",
         type=Path,
         default=None,
-        help="Config directory override. Defaults to $XDG_CONFIG_HOME/claude-code-assist.",
+        help="Config directory override. Defaults to $XDG_CONFIG_HOME/claude-companion.",
     )
     parser.add_argument(
         "--debug",
@@ -52,8 +51,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 def _resolve_config_dir(override: Path | None) -> Path:
     if override is not None:
         return override
-    xdg = os.environ.get("XDG_CONFIG_HOME")
-    return Path(xdg) / "claude-code-assist" if xdg else Path.home() / ".config" / "claude-code-assist"
+    from claude_code_assist.paths import default_config_dir  # noqa: PLC0415
+
+    return default_config_dir()
 
 
 def run(argv: list[str]) -> int:

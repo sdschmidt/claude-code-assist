@@ -1,10 +1,14 @@
 """Companion sprite frames — load + index PNGs from disk.
 
-Frames get tight-cropped on load: we compute the *union* bounding box
-of opaque pixels across all 10 frames and crop every frame to it. That
-keeps the character's relative position consistent across the
-animation while removing the transparent padding Gemini-generated
-cells carry around their cells.
+Frames get tight-cropped on load: we first paste each source PNG onto
+a shared ``(max_w × max_h)`` canvas, bottom-centered, so every frame
+shares a coordinate system whose ground line is the bottom edge. Then
+we compute the *union* bounding box of opaque pixels across all 10
+anchored frames and crop every frame to it. That keeps the
+character's feet flush with the bottom of every output pixmap — even
+when source PNGs have different heights (e.g. a 100×50 walk cell and
+a 100×100 fall cell) — and removes the transparent padding
+Gemini-generated cells carry around their cells.
 """
 
 from __future__ import annotations
@@ -73,7 +77,8 @@ def load_frames(
             logger.warning("Failed to load sprite %s", path, exc_info=True)
             pil_frames.append(None)
 
-    bbox = _union_opaque_bbox(pil_frames)
+    anchored = _anchor_frames(pil_frames)
+    bbox = _union_opaque_bbox(anchored)
     if bbox is None:
         return [QPixmap() for _ in range(_FRAME_COUNT)], 1.0
 
@@ -83,13 +88,46 @@ def load_frames(
     aspect = crop_w / crop_h if crop_h > 0 else 1.0
 
     out: list[QPixmap] = []
-    for img in pil_frames:
+    for img in anchored:
         if img is None:
             out.append(QPixmap())
             continue
         cropped = img.crop((left, top, right, bottom))
         out.append(_pil_to_qpixmap(cropped, device_pixel_ratio))
     return out, aspect
+
+
+def _anchor_frames(frames: list[Image.Image | None]) -> list[Image.Image | None]:
+    """Paste each frame onto a shared (max_w × max_h) bottom-centered canvas.
+
+    Source PNGs may have different dimensions (e.g. WALK is 100×50,
+    FALL is 100×100). ``Image.getbbox`` measures from the top-left, so
+    unioning raw bboxes across mixed-size frames produces a crop that
+    leaves transparent padding *below* the character in the shorter
+    frames. We re-anchor everything bottom-center first so the
+    artist's implicit baseline (feet on bottom edge) becomes a true
+    geometric baseline.
+    """
+    sized = [f for f in frames if f is not None]
+    if not sized:
+        return list(frames)
+    max_w = max(f.width for f in sized)
+    max_h = max(f.height for f in sized)
+
+    anchored: list[Image.Image | None] = []
+    for img in frames:
+        if img is None:
+            anchored.append(None)
+            continue
+        if img.width == max_w and img.height == max_h:
+            anchored.append(img)
+            continue
+        canvas = Image.new("RGBA", (max_w, max_h), (0, 0, 0, 0))
+        offset_x = (max_w - img.width) // 2
+        offset_y = max_h - img.height
+        canvas.paste(img, (offset_x, offset_y), img)
+        anchored.append(canvas)
+    return anchored
 
 
 def _union_opaque_bbox(frames: list[Image.Image | None]) -> tuple[int, int, int, int] | None:
