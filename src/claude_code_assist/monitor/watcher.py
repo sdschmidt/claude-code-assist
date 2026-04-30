@@ -3,22 +3,123 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from watchdog.events import FileCreatedEvent, FileModifiedEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
-from claude_code_assist.monitor.parser import parse_jsonl_line
+from claude_code_assist.monitor.parser import MAX_SUMMARY_LENGTH, SessionEvent, parse_jsonl_line
 
 if TYPE_CHECKING:
     from queue import Queue
 
     from watchdog.observers.api import BaseObserver
 
-    from claude_code_assist.monitor.parser import SessionEvent
-
 logger = logging.getLogger(__name__)
+
+# Coalescer debounce — how long the assistant has to be silent before
+# we flush a buffered turn. 1.5 s is comfortably longer than a typical
+# pause between text and the next tool_use, but short enough that
+# commentary still feels prompt at end-of-turn.
+_COALESCE_DEBOUNCE_SECONDS = 1.5
+
+
+class _TurnCoalescer:
+    """Buffers per-block ``SessionEvent``s into one event per turn.
+
+    Why: Claude Code writes one JSONL line per content block, so a
+    single assistant turn ("explain → read → edit → run tests → wrap")
+    arrives as 5+ tiny fragments. Reacting to each fragment makes the
+    companion narrate every pause; coalescing lets it react to the
+    whole turn.
+
+    Flush triggers:
+    * A real user message (``role=user`` with non-tool-result content)
+      arrives — it's emitted *immediately* (no buffering, so commentary
+      on direct address stays snappy) and any prior buffered turn is
+      flushed first.
+    * The assistant has been silent for ``_COALESCE_DEBOUNCE_SECONDS``
+      since the last buffered block.
+    """
+
+    def __init__(
+        self, output_queue: Queue[SessionEvent], *, debounce_seconds: float = _COALESCE_DEBOUNCE_SECONDS
+    ) -> None:
+        self._queue = output_queue
+        self._debounce = debounce_seconds
+        self._lock = threading.Lock()
+        self._buffer: list[SessionEvent] = []
+        self._timer: threading.Timer | None = None
+
+    def feed(self, event: SessionEvent) -> None:
+        """Process one parsed event."""
+        with self._lock:
+            if event.role == "user" and not event.is_tool_result:
+                # Fresh human input — close any open turn first, then
+                # emit this event without buffering so the React loop
+                # sees it on the next tick.
+                self._flush_locked()
+                self._queue.put(event)
+                return
+            self._buffer.append(event)
+            self._reset_timer_locked()
+
+    def flush_now(self) -> None:
+        """Forced flush — used on shutdown so an in-progress turn isn't lost."""
+        with self._lock:
+            self._flush_locked()
+
+    def _reset_timer_locked(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+        self._timer = threading.Timer(self._debounce, self._flush_due_to_debounce)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _flush_due_to_debounce(self) -> None:
+        with self._lock:
+            self._flush_locked()
+
+    def _flush_locked(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        if not self._buffer:
+            return
+        coalesced = _coalesce(self._buffer)
+        self._buffer = []
+        if coalesced is not None:
+            self._queue.put(coalesced)
+
+
+def _coalesce(events: list[SessionEvent]) -> SessionEvent | None:
+    """Combine same-turn events into one focal SessionEvent.
+
+    Tool_result events get inline ``[result: …]`` framing already
+    (via the parser); we just stitch the summaries together in arrival
+    order so the LLM sees the turn as one continuous narrative.
+    """
+    if not events:
+        return None
+    has_assistant = any(ev.role == "assistant" for ev in events)
+    role = "assistant" if has_assistant else events[0].role
+    parts: list[str] = []
+    for ev in events:
+        text = ev.summary.strip()
+        if text:
+            parts.append(text)
+    summary = " ".join(parts)
+    if len(summary) > MAX_SUMMARY_LENGTH:
+        summary = summary[: MAX_SUMMARY_LENGTH - 1] + "…"
+    return SessionEvent(
+        event_type=events[0].event_type,
+        role=role,
+        summary=summary,
+        timestamp=events[-1].timestamp,
+        is_tool_result=False,
+    )
 
 
 def encode_project_path(project_path: str) -> str:
@@ -56,6 +157,7 @@ class SessionWatcher:
         self._event_queue = event_queue
         self._file_positions: dict[Path, int] = {}
         self._observer: BaseObserver | None = None
+        self._coalescer = _TurnCoalescer(event_queue)
 
     def _process_file(self, path: Path) -> None:
         """Read new lines from a session file and parse them."""
@@ -72,7 +174,7 @@ class SessionWatcher:
                         continue
                     event = parse_jsonl_line(line)
                     if event is not None:
-                        self._event_queue.put(event)
+                        self._coalescer.feed(event)
                 self._file_positions[path] = f.tell()
         except Exception:
             logger.exception("Error reading session file %s", path)
@@ -138,6 +240,9 @@ class SessionWatcher:
             self._observer.join(timeout=5)
             self._observer = None
             logger.info("Stopped session watcher")
+        # Flush any partial turn we were buffering — better to surface
+        # it late than to drop it.
+        self._coalescer.flush_now()
 
 
 class _SessionFileHandler(FileSystemEventHandler):
