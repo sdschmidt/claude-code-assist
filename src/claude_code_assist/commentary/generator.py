@@ -14,9 +14,12 @@ from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
 from claude_code_assist.commentary import transcript
 from claude_code_assist.commentary.prompts import (
+    MEMORY_MAX_LENGTH,
     RECENT_COMMENTS_MAX,
     build_event_prompt,
     build_idle_prompt,
+    build_memory_update_system_prompt,
+    build_memory_update_user_prompt,
     build_reply_prompt,
     build_system_prompt,
 )
@@ -117,20 +120,21 @@ _PREAMBLE_RE = re.compile(
 )
 
 
-def _clean_comment(text: str, max_length: int) -> str:
+def _clean_comment(text: str, max_length: int) -> str | None:
     """Enforce single-line and length limit on model output.
 
     Strips preamble patterns, collapses to first line, trims quotes.
-
-    Args:
-        text: Raw model output.
-        max_length: Maximum allowed character length.
-
-    Returns:
-        Cleaned, truncated comment text.
+    Returns ``None`` when the model emitted ``<skip>`` (the "stay
+    silent" escape \u2014 see ``build_system_prompt`` SILENCE clause) or
+    when the output is empty after cleaning.
     """
     # Collapse to first line only (no multi-paragraph responses)
     first_line = text.strip().split("\n")[0].strip()
+    # Skip token: model chose silence. Match permissively \u2014 some models
+    # wrap the token in quotes / backticks despite the rule.
+    stripped = first_line.strip().strip("`'\"").lower()
+    if stripped == "<skip>" or stripped == "skip":
+        return None
     # Strip preamble patterns (e.g. "Terminal companion says: ")
     first_line = _PREAMBLE_RE.sub("", first_line).strip()
     # Strip surrounding quotes if present
@@ -139,6 +143,8 @@ def _clean_comment(text: str, max_length: int) -> str:
     # Strip leading ** (bold preamble) but preserve single * (markdown italics)
     if first_line.startswith("**"):
         first_line = first_line.lstrip("*").rstrip()
+    if not first_line:
+        return None
     # Enforce hard length limit
     if len(first_line) > max_length:
         first_line = first_line[: max_length - 1] + "\u2026"
@@ -457,3 +463,45 @@ def submit_idle_chatter(
         Future resolving to the idle chatter string, or None.
     """
     return _executor.submit(_run_generate_idle_chatter, companion, config, max_length)
+
+
+def _run_update_memory(
+    companion: CompanionProfile,
+    observation: str,
+    config: CompanionConfig,
+) -> str | None:
+    """Blocking memory update — runs in a background thread.
+
+    Returns the new memory string, or None on failure (caller keeps
+    the existing memory untouched).
+    """
+    try:
+        raw = _call_llm(
+            system_prompt=build_memory_update_system_prompt(companion),
+            user_prompt=build_memory_update_user_prompt(companion.session_memory, observation),
+            config=config,
+            kind="memory",
+        )
+    except (RuntimeError, asyncio.CancelledError, OSError):
+        logger.exception("Failed to update session memory")
+        return None
+    if not raw:
+        return None
+    text = raw.strip()
+    if len(text) > MEMORY_MAX_LENGTH:
+        text = text[: MEMORY_MAX_LENGTH - 1] + "…"
+    return text
+
+
+def submit_memory_update(
+    companion: CompanionProfile,
+    observation: str,
+    config: CompanionConfig,
+) -> Future[str | None]:
+    """Submit a memory-update task to the background executor.
+
+    The caller is responsible for assigning the result back onto
+    ``companion.session_memory`` when the future resolves — this
+    keeps the executor stateless and keeps mutation on the main thread.
+    """
+    return _executor.submit(_run_update_memory, companion, observation, config)

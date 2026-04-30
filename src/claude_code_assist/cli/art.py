@@ -625,9 +625,7 @@ def _load_companion_config(config_dir: Path) -> CompanionConfig:
     return _Config(config_dir=config_dir)
 
 
-def _pick_premade_manually(
-    options: tuple[PremadeOption, ...], default_slug: str
-) -> PremadeOption | None:
+def _pick_premade_manually(options: tuple[PremadeOption, ...], default_slug: str) -> PremadeOption | None:
     """Manual override picker — used when the user rejects the LLM match."""
     choices = [
         questionary.Choice(

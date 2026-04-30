@@ -387,12 +387,7 @@ async def _generate_companion_async(
         fall_description=str(data.get("fall_description", "")).strip(),
         landing_description=str(data.get("landing_description", "")).strip(),
     )
-    full_prompt = (
-        "=== SYSTEM PROMPT ===\n"
-        f"{_SYSTEM_PROMPT}\n\n"
-        "=== USER PROMPT ===\n"
-        f"{user_prompt}\n"
-    )
+    full_prompt = f"=== SYSTEM PROMPT ===\n{_SYSTEM_PROMPT}\n\n=== USER PROMPT ===\n{user_prompt}\n"
     return companion, full_prompt
 
 

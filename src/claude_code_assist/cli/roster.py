@@ -227,9 +227,7 @@ def _pick_companion(entries: list[_RosterEntry]) -> _RosterEntry | None:
         choices.append(questionary.Separator(" "))
     for entry in by_name:
         choices.append(questionary.Choice(title=_format_choice_title(entry), value=entry.slot))
-    choices.append(
-        questionary.Choice(title=menu_title("quit", "", shortcut="q"), value=_QUIT_SENTINEL)
-    )
+    choices.append(questionary.Choice(title=menu_title("quit", "", shortcut="q"), value=_QUIT_SENTINEL))
     try:
         question = questionary.select(
             "Choose a companion to activate:",

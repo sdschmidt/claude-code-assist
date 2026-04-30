@@ -89,3 +89,13 @@ class CompanionProfile(BaseModel):
             "hard impact reaction otherwise — splat, shatter, dent, dazed) used in the macos-desktop sprite prompt."
         ),
     )
+    session_memory: str = Field(
+        default="",
+        description=(
+            "Running, LLM-summarised paragraph of what's happened this session — themes, "
+            "recurring patterns, what the developer is working on. Updated in the "
+            "background when events rotate out of the rolling context window. Threaded "
+            "into the commentary system prompt so the companion has memory beyond the "
+            "5-event sliding window. Persisted so memory carries across app restarts."
+        ),
+    )

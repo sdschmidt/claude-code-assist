@@ -23,7 +23,12 @@ from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import TYPE_CHECKING
 
-from claude_code_assist.commentary.generator import submit_comment, submit_idle_chatter, submit_reply
+from claude_code_assist.commentary.generator import (
+    submit_comment,
+    submit_idle_chatter,
+    submit_memory_update,
+    submit_reply,
+)
 from claude_code_assist.monitor.text_watcher import TextFileWatcher
 from claude_code_assist.monitor.watcher import SessionWatcher, encode_project_path
 
@@ -110,6 +115,7 @@ class CommentaryBackend:
 
         self._pending_comment: Future[str | None] | None = None
         self._pending_idle: Future[str | None] | None = None
+        self._pending_memory: Future[str | None] | None = None
         self._recent_events: list[SessionEvent] = []
         self._comment_count = 0
         # Use ``-inf`` so the first event is never blocked by the cooldown.
@@ -229,9 +235,13 @@ class CommentaryBackend:
                 logger.exception("Comment future raised")
                 comment = None
             self._pending_comment = None
+            # Apply the cooldown whenever an LLM call completes — even
+            # when the model chose ``<skip>`` (returns None) — so a
+            # silent decision doesn't trigger an instant retry on the
+            # next event.
+            self._last_comment_time = now
             if comment:
                 self._record_comment(comment)
-                self._last_comment_time = now
                 update.new_comment = comment
 
         # 2. Harvest a completed idle-chatter future.
@@ -247,6 +257,19 @@ class CommentaryBackend:
             if idle_text and update.new_comment is None:
                 self._record_comment(idle_text)
                 update.new_comment = idle_text
+
+        # 2b. Harvest a completed memory-update future. Mutation lives
+        # on the main thread — the executor only computed the new
+        # string. Failed updates leave the existing memory untouched.
+        if self._pending_memory is not None and self._pending_memory.done():
+            try:
+                new_memory = self._pending_memory.result()
+            except RuntimeError:
+                logger.exception("Memory update future raised")
+                new_memory = None
+            self._pending_memory = None
+            if new_memory:
+                self._companion.session_memory = new_memory
 
         # 3. Drain one queued session event so a burst doesn't lock up the tick.
         try:
@@ -310,10 +333,26 @@ class CommentaryBackend:
     # ------------------------------------------------------------------
 
     def _record_event(self, event: SessionEvent) -> None:
-        """Append ``event`` to the rolling session-context window."""
+        """Append ``event`` to the rolling session-context window.
+
+        When the window overflows, the oldest event is about to be
+        forgotten — fold it into ``session_memory`` first via a
+        background LLM call so the companion keeps long-horizon
+        context. Skips the update if a memory call is already in
+        flight; the next overflow will catch up.
+        """
         self._recent_events.append(event)
-        if len(self._recent_events) > _RECENT_EVENTS_MAX:
-            self._recent_events = self._recent_events[-_RECENT_EVENTS_MAX:]
+        if len(self._recent_events) <= _RECENT_EVENTS_MAX:
+            return
+        rotated = self._recent_events[0]
+        self._recent_events = self._recent_events[-_RECENT_EVENTS_MAX:]
+        if self._pending_memory is None and rotated.summary:
+            observation = f"[{rotated.role}] {rotated.summary}"
+            self._pending_memory = submit_memory_update(
+                self._companion,
+                observation,
+                self._config,
+            )
 
     def _record_comment(self, comment: str) -> None:
         self._companion.last_comment = comment

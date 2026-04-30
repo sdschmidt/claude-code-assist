@@ -41,8 +41,8 @@ class PremadeOption:
     """One bundled art set the matcher can pick from."""
 
     slug: str
-    description: str       # full ``<creature_type>; anatomy: ...`` line for the LLM
-    creature_type: str     # leading segment — used by the heuristic shortcut
+    description: str  # full ``<creature_type>; anatomy: ...`` line for the LLM
+    creature_type: str  # leading segment — used by the heuristic shortcut
     has_icon: bool
 
 
@@ -78,7 +78,9 @@ def list_premade_options() -> tuple[PremadeOption, ...]:
         if not (frames_present and descriptor_path.is_file()):
             logger.debug(
                 "Skipping premade %s (incomplete: frames=%s, descriptor=%s)",
-                entry.name, frames_present, descriptor_path.is_file(),
+                entry.name,
+                frames_present,
+                descriptor_path.is_file(),
             )
             continue
         try:
@@ -138,9 +140,7 @@ _MATCH_SYSTEM_PROMPT = (
 )
 
 
-def _build_match_user_prompt(
-    companion: CompanionProfile, options: tuple[PremadeOption, ...]
-) -> str:
+def _build_match_user_prompt(companion: CompanionProfile, options: tuple[PremadeOption, ...]) -> str:
     profile_block = (
         "Companion profile:\n"
         f"- name: {companion.name}\n"
@@ -148,9 +148,7 @@ def _build_match_user_prompt(
         f"- body_plan: {companion.body_plan or '(empty)'}\n"
         f"- personality: {companion.personality}\n"
     )
-    options_block = "Premade options:\n" + "\n".join(
-        f'- slug="{opt.slug}": {opt.description}' for opt in options
-    )
+    options_block = "Premade options:\n" + "\n".join(f'- slug="{opt.slug}": {opt.description}' for opt in options)
     return f"{profile_block}\n{options_block}\n"
 
 
@@ -162,9 +160,7 @@ def _tokenize(text: str) -> set[str]:
     return {t for t in _TOKEN_SPLIT_RE.split(text.lower()) if len(t) >= 3}
 
 
-def _heuristic_match(
-    companion: CompanionProfile, options: tuple[PremadeOption, ...]
-) -> PremadeOption | None:
+def _heuristic_match(companion: CompanionProfile, options: tuple[PremadeOption, ...]) -> PremadeOption | None:
     """Return an option when ``companion.creature_type`` uniquely identifies one slug.
 
     Word-level matching (not substring) so ``imp`` matches ``black_imp`` but
@@ -210,9 +206,7 @@ def match_premade(
 
     user_prompt = _build_match_user_prompt(companion, options_tuple)
     try:
-        data = asyncio.run(
-            _call_profile_llm(_MATCH_SYSTEM_PROMPT, user_prompt, config, context="premade match")
-        )
+        data = asyncio.run(_call_profile_llm(_MATCH_SYSTEM_PROMPT, user_prompt, config, context="premade match"))
     except Exception as exc:  # noqa: BLE001
         logger.warning("Premade LLM match failed: %s", exc)
         return options_tuple[0], f"(LLM match failed: {exc}; using {options_tuple[0].slug})"

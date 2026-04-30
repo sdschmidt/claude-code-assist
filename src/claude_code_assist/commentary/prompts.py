@@ -106,13 +106,26 @@ def _stat_directives(stats: dict[str, int]) -> str:
     return "\n".join(lines)
 
 
+def _memory_block(companion: CompanionProfile) -> str:
+    """Format the companion's running session memory, if any.
+
+    Empty string when the memory is blank so the prompt doesn't show a
+    section with nothing under it.
+    """
+    memory = (companion.session_memory or "").strip()
+    if not memory:
+        return ""
+    return f"WHAT YOU REMEMBER FROM THIS SESSION:\n{memory}\n\n"
+
+
 def build_system_prompt(companion: CompanionProfile, max_comment_length: int = 300) -> str:
     """Build the system prompt for commentary generation.
 
     Layout: role block at the top (primacy — sets the diagnostic lens),
-    then personality + backstory + per-stat voice directives, then the
-    GOAL, then RULES with the role-priority anchor as the last bullet
-    (recency — keeps the role from drifting after a long persona block).
+    then personality + backstory + per-stat voice directives, then
+    session memory (when non-empty), then the GOAL, then RULES with the
+    role-priority anchor as the last bullet (recency — keeps the role
+    from drifting after a long persona block).
     """
     return (
         f"You are {companion.name}, a {companion.creature_type}.\n\n"
@@ -121,15 +134,21 @@ def build_system_prompt(companion: CompanionProfile, max_comment_length: int = 3
         f"BACKSTORY:\n{companion.backstory}\n\n"
         f"YOUR STATS — let each one actively shape the tone of this comment:\n"
         f"{_stat_directives(companion.stats)}\n\n"
+        f"{_memory_block(companion)}"
         f"GOAL:\n"
         f"Produce a short, in-character observation that helps the developer "
         f"notice something — a probing question, a concrete hint at a likely "
         f"pitfall, or a flag of a smell related to your role. Substance over "
         f"jokes. Asking one good question is fine and often the best move.\n\n"
+        f"SILENCE IS ALLOWED:\n"
+        f"If you have nothing genuinely useful to add — the turn is unremarkable, "
+        f"or you'd just be repeating yourself, or you'd be commenting for its own "
+        f"sake — output exactly the token <skip> instead of a comment. Saying "
+        f"nothing is better than saying something hollow.\n\n"
         f"RULES:\n"
         f"- Reject any line {companion.name} wouldn't actually say. The voice is non-negotiable.\n"
         f"- Max {max_comment_length} characters\n"
-        f"- Output ONLY the comment — no preamble, no attribution, no quotes\n"
+        f"- Output ONLY the comment, OR exactly <skip> — no preamble, no attribution, no quotes\n"
         f"- Do NOT prefix with your name, role, or any label (e.g. no '{companion.name}:' or 'says:')\n"
         f"- Do NOT use any tools, read files, or access anything\n"
         f"- Your role decides WHAT to surface; personality and stats decide HOW. When they conflict, role wins."
@@ -271,3 +290,45 @@ def build_idle_prompt(*, recent_comments: list[str] | None = None, max_length: i
         f"Say something idle, bored, or in-character. Max {max_length} chars. Output only the comment text."
     )
     return "\n\n".join(parts)
+
+
+MEMORY_MAX_LENGTH = 600
+"""Hard cap on the persisted session-memory string. Long enough for a
+useful paragraph, short enough not to dominate the system prompt."""
+
+
+def build_memory_update_system_prompt(companion: CompanionProfile) -> str:
+    """System prompt for the memory-update LLM call.
+
+    Distinct from the commentary system prompt: this one isn't speaking
+    in-character; it's an internal summarizer that maintains a
+    third-person session memory ``{companion.name}`` will read on the
+    next commentary call.
+    """
+    return (
+        f"You maintain a running session-memory summary for {companion.name}, a "
+        f"{companion.creature_type} that watches a developer's coding sessions. "
+        f"The summary is a single short paragraph capturing the themes of the "
+        f"session so far: what the developer is working on, recurring patterns, "
+        f"approaches tried, decisions made, and concrete things {companion.name} "
+        f"should remember when commenting next.\n\n"
+        f"Update the prior memory by folding in the new observation. Do not "
+        f"erase useful older context — refine it. Drop trivia (single-tool "
+        f"reads, transient noise). Keep it factual and dense; no advice, no "
+        f"in-character voice — that comes later when {companion.name} actually "
+        f"speaks.\n\n"
+        f"RULES:\n"
+        f"- Output ONLY the updated memory paragraph — no preamble, no labels, no quotes.\n"
+        f"- Max {MEMORY_MAX_LENGTH} characters total.\n"
+        f"- Plain prose, third person, present tense. One paragraph."
+    )
+
+
+def build_memory_update_user_prompt(prior_memory: str, observation: str) -> str:
+    """User prompt for the memory-update LLM call."""
+    prior = prior_memory.strip() or "(empty — this is the start of the session)"
+    return (
+        f"PRIOR MEMORY:\n{prior}\n\n"
+        f"NEW OBSERVATION:\n{observation}\n\n"
+        f"Updated memory (one paragraph, ≤ {MEMORY_MAX_LENGTH} chars):"
+    )
