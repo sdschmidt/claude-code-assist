@@ -58,6 +58,18 @@ def format_xp_bar_segments(
     return _BAR_FILLED * filled, _BAR_EMPTY * (cells - filled)
 
 
+def format_xp_percent(
+    counter: int,
+    *,
+    threshold: int = COMMENT_LEVEL_THRESHOLD,
+) -> str:
+    """Return the XP progress as a ``"NN %"`` string clamped to ``[0, 100]``."""
+    if threshold <= 0:
+        return "0 %"
+    progress = max(0, min(counter, threshold))
+    return f"{int((progress / threshold) * 100)} %"
+
+
 def is_eligible_for_levelup(companion: CompanionProfile, today: date | None = None) -> bool:
     """Return ``True`` when the player has earned at least one level-up.
 

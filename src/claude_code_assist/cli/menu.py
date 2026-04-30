@@ -100,7 +100,7 @@ def _print_banner(config_dir: Path) -> None:
         return
 
     from claude_code_assist.models.role import ROLE_CATALOG  # noqa: PLC0415
-    from claude_code_assist.profile.leveling import format_xp_bar_segments  # noqa: PLC0415
+    from claude_code_assist.profile.leveling import format_xp_bar_segments, format_xp_percent  # noqa: PLC0415
 
     color = companion.rarity.color
     rarity_name = companion.rarity.value.title()
@@ -117,9 +117,10 @@ def _print_banner(config_dir: Path) -> None:
         f"{role_block}"
     )
     # XP bar mirrors the tray header: rarity-colored fill, dim background,
-    # no numeric value.
+    # trailing percentage.
     xp_filled, xp_empty = format_xp_bar_segments(companion.comment_counter)
-    console.print(f"[dim]XP[/dim] [{color}]{xp_filled}[/{color}][dim]{xp_empty}[/dim]")
+    xp_percent = format_xp_percent(companion.comment_counter)
+    console.print(f"[dim]XP[/dim] [{color}]{xp_filled}[/{color}][dim]{xp_empty}[/dim] [dim]{xp_percent}[/dim]")
 
 
 def _build_choices(

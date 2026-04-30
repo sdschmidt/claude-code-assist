@@ -35,6 +35,7 @@ from claude_code_assist.models.rarity import Rarity
 from claude_code_assist.profile.leveling import (
     eligibility_reason,
     format_xp_bar_segments,
+    format_xp_percent,
     is_eligible_for_levelup,
 )
 
@@ -206,15 +207,17 @@ def install_tray(
         menu.addAction(quit_action)
 
     def _on_about_to_show() -> None:
-        # Cheap re-check: comment_counter ticks up at runtime so a
-        # session that started "not eligible" can become eligible
-        # before the next launch. Only rebuild when the bit actually
-        # flips so right-click → open is fast in the common case.
+        # Always repopulate so live values (XP bar, stats, last_comment)
+        # match what the rest of the app sees — the menu was getting
+        # stale because we only rebuilt on eligibility flips, leaving
+        # the XP label frozen at the value captured when the tray was
+        # installed. The icon only redraws when eligibility actually
+        # changes (icon rendering is expensive).
         new_eligible = is_eligible_for_levelup(companion)
         if new_eligible != eligible_state["value"]:
             eligible_state["value"] = new_eligible
             _set_icon(new_eligible)
-            _populate(new_eligible)
+        _populate(eligible_state["value"])
 
     def _refresh_levelup() -> None:
         # Called by the host app after a successful level-up: the
@@ -569,10 +572,11 @@ def _add_header(menu: QMenu, companion: CompanionProfile) -> None:
     layout.addWidget(label)
 
     # XP bar — same block characters as the per-stat bars, rarity-colored
-    # fill, no numeric value (the user explicitly asked for the bar
-    # alone). A separate ``QLabel`` so the monospace font lands cleanly;
-    # the rest of the header runs in the menu's proportional font.
+    # fill, with a trailing percentage. A separate ``QLabel`` so the
+    # monospace font lands cleanly; the rest of the header runs in the
+    # menu's proportional font.
     xp_filled, xp_empty = format_xp_bar_segments(companion.comment_counter)
+    xp_percent = format_xp_percent(companion.comment_counter)
     xp_label = QLabel()
     xp_label.setFont(_monospace_font())
     xp_label.setTextFormat(Qt.TextFormat.RichText)
@@ -580,6 +584,7 @@ def _add_header(menu: QMenu, companion: CompanionProfile) -> None:
         f'<span style="color:#888;">XP&nbsp;</span>'
         f'<span style="color:{color};">{xp_filled}</span>'
         f'<span style="color:#444;">{xp_empty}</span>'
+        f'<span style="color:#888;">&nbsp;{xp_percent}</span>'
     )
     layout.addWidget(xp_label)
 
