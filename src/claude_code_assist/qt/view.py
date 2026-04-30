@@ -100,7 +100,11 @@ class CompanionWindow(QWidget):
     def _apply_dimensions(self) -> None:
         self._sprite_height = max(1, int(round(SPRITE_CANVAS * self._scale)))
         self._sprite_width = max(1, int(round(self._sprite_height * self._aspect)))
-        self.resize(self._sprite_width, self._sprite_height)
+        # ``setFixedSize`` (rather than ``resize``) — Qt's frameless
+        # hint doesn't strip the macOS resize style mask, so without
+        # this the user can grab the invisible top corners and resize
+        # the sprite window.
+        self.setFixedSize(self._sprite_width, self._sprite_height)
         self._label.setGeometry(0, 0, self._sprite_width, self._sprite_height)
 
     def _refresh_pixmap(self) -> None:

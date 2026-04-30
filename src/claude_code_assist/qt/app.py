@@ -8,7 +8,8 @@ Wires together a 30 Hz timer, the ``CompanionController`` state machine, the
 ``CompanionWindow``, the speech ``SpeechBubble``, the in-process commentary
 backend, and the full tray menu (header, info rows, sprite preview,
 stats bars, bio/backstory, gravity/walk toggles, Open Config Folder,
-Quit). Window perching lands in M5.
+Quit). On macOS the companion can also perch on top of other app
+windows (M5) — see ``window_surfaces``.
 """
 
 from __future__ import annotations
@@ -90,7 +91,7 @@ def _build_status_panel(companion, comment: str, state: str, *, console_width: i
     from rich.text import Text  # noqa: PLC0415
 
     from claude_code_assist.models.role import ROLE_CATALOG  # noqa: PLC0415
-    from claude_code_assist.profile.leveling import format_xp_bar_segments  # noqa: PLC0415
+    from claude_code_assist.profile.leveling import format_xp_bar_segments, format_xp_percent  # noqa: PLC0415
 
     color = companion.rarity.color
 
@@ -109,10 +110,12 @@ def _build_status_panel(companion, comment: str, state: str, *, console_width: i
     body = Text(comment) if comment else Text("(no commentary yet)", style="dim italic")
 
     xp_filled, xp_empty = format_xp_bar_segments(companion.comment_counter)
+    xp_percent = format_xp_percent(companion.comment_counter)
     xp_segment = Text()
     xp_segment.append(" XP ", style="dim")
     xp_segment.append(xp_filled, style=color)
     xp_segment.append(xp_empty, style="dim")
+    xp_segment.append(f" {xp_percent} ", style="dim")
 
     state_segment = Text(f" {state} ", style="bold dim")
 
@@ -268,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
     from claude_code_assist.qt.sprites import SPRITE_CANVAS, Frame, load_frames
     from claude_code_assist.qt.tray import install_tray
     from claude_code_assist.qt.view import CompanionWindow
+    from claude_code_assist.qt.window_surfaces import current_surfaces, get_window_number
 
     art_dir, profile_path = _resolve_paths(args)
 
@@ -387,13 +391,28 @@ def main(argv: list[str] | None = None) -> int:
     bubble.hide()
     app.applicationStateChanged.connect(lambda _state: promote_window_level(bubble))
 
+    # Window perching (M5, macOS only). Track the CGWindow IDs of our
+    # own windows so the companion never tries to perch on itself, and
+    # refresh on activation events in case Qt re-creates an NSWindow.
+    excluded_window_ids: set[int] = set()
+
+    def _refresh_excluded_window_ids() -> None:
+        excluded_window_ids.clear()
+        for w in (window, bubble):
+            wid = get_window_number(w)
+            if wid > 0:
+                excluded_window_ids.add(wid)
+
+    _refresh_excluded_window_ids()
+    app.applicationStateChanged.connect(lambda _state: _refresh_excluded_window_ids())
+
     # Tray keeps a strong ref via ``parent=app``; we keep one too so the icon
     # doesn't disappear on garbage-collection.
     def _react_now() -> None:
         # Ask the backend for a fresh comment; if it can't (budget /
         # in-flight) show a one-line bubble so the click feels responsive.
         if not backend.request_comment_now():
-            bubble.show_comment("…thinking already, hang on.", duration_s=2.0)
+            bubble.show_comment("... thinking already, hang on.", duration_s=2.0)
 
     def _set_gravity(enabled: bool) -> None:
         controller.gravity_enabled = enabled
@@ -469,27 +488,17 @@ def main(argv: list[str] | None = None) -> int:
     def _on_double_click() -> None:
         nonlocal double_click_phase
         phase = double_click_phase
-        double_click_phase = (phase + 1) % 4
+        double_click_phase = (phase + 1) % 2
+        controller.react()
 
-        if phase == 0:
-            controller.react()
+        if phase == 1:
             _react_now()
             return
 
-        if phase == 2:
-            controller.react()
-            bubble.show_comment("...", duration_s=2.5)
-            return
-
-        # phases 1 and 3 — replay the last comment if we have one.
-        if companion.last_comment:
-            controller.react()
+        if phase == 0 and companion.last_comment:
             bubble.show_comment(companion.last_comment)
         else:
-            # No history yet: treat like a regular react so the user
-            # still gets feedback on the click.
-            controller.react()
-            _react_now()
+            bubble.show_comment("...", duration_s=2.5)
 
     window.on_mouse_double_click = _on_double_click
 
@@ -535,7 +544,8 @@ def main(argv: list[str] | None = None) -> int:
             bubble.show_comment(update.new_comment)
             controller.react()
 
-        idx = controller.tick(rect)
+        surfaces = current_surfaces(excluding=frozenset(excluded_window_ids))
+        idx = controller.tick(rect, surfaces)
         window.set_frame(frames[idx], mirrored=controller.mirrored())
         x, y = controller.position()
         window.set_position(x, y)

@@ -15,8 +15,14 @@ from __future__ import annotations
 
 import random
 from enum import Enum, auto
+from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QRect
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from claude_code_assist.qt.window_surfaces import Surface
 
 # Frame indices
 F_IDLE_A = 0
@@ -46,6 +52,12 @@ _IDLE_TO_WALK_MAX = int(_TICK_HZ * 3.0)
 _WALK_DURATION_MIN = int(_TICK_HZ * 3.0)
 _WALK_DURATION_MAX = int(_TICK_HZ * 8.0)
 _WALK_FRAME_RATE = int(_TICK_HZ / 6)  # toggle walk_a/walk_b ~6 Hz
+
+# Perching: while standing on a window surface, the companion can
+# walk past the surface's edge until 75% of its body is past, i.e. its
+# center has moved one quarter of its width beyond the edge. Past
+# that, it drops.
+_PERCH_OVERHANG_FRACTION = 0.25
 
 
 class _State(Enum):
@@ -79,6 +91,11 @@ class CompanionController:
         self._state_frames: int = 0
         self._next_state_at: int = random.randint(_IDLE_TO_WALK_MIN, _IDLE_TO_WALK_MAX)
         self._awake_frames: int = _AWAKE_FRAMES
+        # Perching: ID of the window surface the companion is standing
+        # on, or ``None`` for the screen floor / mid-air. Refreshed on
+        # every tick from the surfaces list passed in.
+        self._current_surface_id: int | None = None
+        self._surfaces: Sequence[Surface] = ()
         # Blink timer is tracked separately from ``_state_frames`` —
         # they used to share, which meant every blink reset the walk
         # timer and the companion never started walking.
@@ -146,6 +163,8 @@ class CompanionController:
         self._drag_offset_y = y - self._y
         self._vy = 0.0
         self._awake_frames = _AWAKE_FRAMES
+        # Picked up — no longer perched on whatever surface we were on.
+        self._current_surface_id = None
 
     def update_drag(self, x: int, y: int) -> None:
         if self._state != _State.DRAGGING:
@@ -169,12 +188,40 @@ class CompanionController:
     # Tick
     # ------------------------------------------------------------------
 
-    def tick(self, screen_rect: QRect) -> int:
+    def tick(self, screen_rect: QRect, surfaces: Sequence[Surface] = ()) -> int:
         self._screen = screen_rect
+        self._surfaces = surfaces
         self._state_frames += 1
 
         if self._state != _State.SLEEPING:
             self._awake_frames = max(0, self._awake_frames - 1)
+
+        # Re-evaluate perch each tick. If the surface vanished or slid
+        # horizontally out from under the companion's slack zone, drop
+        # the perch. Otherwise follow the surface's top edge — but
+        # asymmetrically:
+        #   * Upward (or small downward) motion: snap, the companion
+        #     sticks to the window.
+        #   * Downward motion faster than ``_GRAVITY`` per tick: the
+        #     companion can't keep up, so we leave it behind and the
+        #     gravity check below transitions it to FALLING.
+        if self._state in (_State.IDLE, _State.WALKING, _State.REACTING, _State.SLEEPING):
+            surface = self._current_surface()
+            if self._current_surface_id is not None:
+                if surface is None:
+                    self._current_surface_id = None
+                else:
+                    center_x = self._x + self.sprite_width / 2
+                    slack = self.sprite_width * _PERCH_OVERHANG_FRACTION
+                    if center_x < surface.rect.left() - slack or center_x > surface.rect.right() + slack:
+                        self._current_surface_id = None
+                    else:
+                        target_y = surface.rect.top() - self.sprite_height
+                        delta_y = target_y - self._y
+                        if delta_y <= _GRAVITY:
+                            self._y = target_y
+                        else:
+                            self._current_surface_id = None
 
         # Toggling gravity on while the sprite is parked mid-air (e.g. the
         # user disabled gravity, dragged it up, dropped it, then re-enabled
@@ -183,7 +230,7 @@ class CompanionController:
         if (
             self.gravity_enabled
             and self._state in (_State.IDLE, _State.WALKING, _State.REACTING, _State.SLEEPING)
-            and self._y < self._screen.bottom() - self.sprite_height
+            and self._y < self._current_floor_y()
         ):
             self._state = _State.FALLING
             self._state_frames = 0
@@ -204,6 +251,26 @@ class CompanionController:
         if self._state == _State.REACTING:
             return self._tick_reacting()
         return F_IDLE_A
+
+    # ------------------------------------------------------------------
+    # Perching helpers
+    # ------------------------------------------------------------------
+
+    def _current_surface(self) -> Surface | None:
+        """Return the surface the companion is perched on, or ``None``."""
+        if self._current_surface_id is None:
+            return None
+        for s in self._surfaces:
+            if s.id == self._current_surface_id:
+                return s
+        return None
+
+    def _current_floor_y(self) -> float:
+        """Top-left y where the sprite sits when standing on its current floor."""
+        surface = self._current_surface()
+        if surface is None:
+            return self._screen.bottom() - self.sprite_height
+        return surface.rect.top() - self.sprite_height
 
     # ------------------------------------------------------------------
     # State handlers
@@ -242,16 +309,32 @@ class CompanionController:
 
     def _tick_walking(self) -> int:
         self._x += _WALK_SPEED * self._walk_dir
-        left_bound = self._screen.left()
-        right_bound = self._screen.right() - self.sprite_width
-        if self._x <= left_bound:
-            self._x = left_bound
-            self._walk_dir = 1
-            self._mirrored = False
-        elif self._x >= right_bound:
-            self._x = right_bound
-            self._walk_dir = -1
-            self._mirrored = True
+
+        surface = self._current_surface()
+        if surface is None:
+            # On the screen floor — clamp at the screen edges, reverse direction.
+            left_bound = self._screen.left()
+            right_bound = self._screen.right() - self.sprite_width
+            if self._x <= left_bound:
+                self._x = left_bound
+                self._walk_dir = 1
+                self._mirrored = False
+            elif self._x >= right_bound:
+                self._x = right_bound
+                self._walk_dir = -1
+                self._mirrored = True
+        else:
+            # Perched: walk off the edge once 75% of the body is past
+            # (i.e. the center has moved one quarter of the sprite width
+            # beyond the surface edge). Then fall.
+            center_x = self._x + self.sprite_width / 2
+            slack = self.sprite_width * _PERCH_OVERHANG_FRACTION
+            if center_x < surface.rect.left() - slack or center_x > surface.rect.right() + slack:
+                self._current_surface_id = None
+                self._state = _State.FALLING
+                self._state_frames = 0
+                self._vy = 0.0
+                return F_FALL
 
         if self._state_frames >= self._next_state_at:
             self._state = _State.IDLE
@@ -263,23 +346,50 @@ class CompanionController:
         return F_WALK_A if (self._walk_anim_counter // _WALK_FRAME_RATE) % 2 == 0 else F_WALK_B
 
     def _tick_falling(self) -> int:
+        prev_bottom = self._y + self.sprite_height
         self._vy += _GRAVITY
         self._y += self._vy
-        floor = self._screen.bottom() - self.sprite_height
-        if self._y >= floor:
-            self._y = floor
-            stunned = abs(self._vy) >= _STUN_VELOCITY
-            self._vy = 0.0
-            self._state_frames = 0
-            if stunned:
-                self._state = _State.LANDED
-                return F_STUNNED
-            # Soft landing — there's no dedicated frame between F_FALL
-            # and idle, so skip LANDED entirely instead of holding the
-            # airborne pose on the ground for ~250 ms.
-            self._state = _State.IDLE
-            return F_IDLE_A
+        current_bottom = self._y + self.sprite_height
+
+        # Pick the highest window surface (smallest top y) the
+        # companion's center swept across this tick. "Highest in the
+        # sweep" means the first surface our bottom would hit.
+        center_x = self._x + self.sprite_width / 2
+        landing: Surface | None = None
+        for surface in self._surfaces:
+            if not (surface.rect.left() <= center_x <= surface.rect.right()):
+                continue
+            top = surface.rect.top()
+            if not (prev_bottom <= top <= current_bottom):
+                continue
+            if landing is None or top < landing.rect.top():
+                landing = surface
+
+        if landing is not None:
+            self._y = landing.rect.top() - self.sprite_height
+            self._current_surface_id = landing.id
+            return self._land()
+
+        screen_floor = self._screen.bottom() - self.sprite_height
+        if self._y >= screen_floor:
+            self._y = screen_floor
+            self._current_surface_id = None
+            return self._land()
         return F_FALL
+
+    def _land(self) -> int:
+        """Shared landing transition for screen floor + window surfaces."""
+        stunned = abs(self._vy) >= _STUN_VELOCITY
+        self._vy = 0.0
+        self._state_frames = 0
+        if stunned:
+            self._state = _State.LANDED
+            return F_STUNNED
+        # Soft landing — there's no dedicated frame between F_FALL and
+        # idle, so skip LANDED entirely instead of holding the airborne
+        # pose on the ground for ~250 ms.
+        self._state = _State.IDLE
+        return F_IDLE_A
 
     def _tick_landed(self) -> int:
         if self._state_frames >= _STUN_FRAMES:
