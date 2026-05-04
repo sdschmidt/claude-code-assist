@@ -369,6 +369,8 @@ def main(argv: list[str] | None = None) -> int:
     window = CompanionWindow()
     window.set_aspect(sprite_aspect)
     window.set_scale(companion_settings.companion_scale)
+    if companion.shiny:
+        window.enable_shiny()
     window.set_frame(frames[Frame.IDLE_A])
     px, py = controller.position()
     window.set_position(px, py)

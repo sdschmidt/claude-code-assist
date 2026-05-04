@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QMouseEvent, QPixmap
 from PySide6.QtWidgets import QLabel, QWidget
 
+from claude_code_assist.qt.shiny import apply_shiny
 from claude_code_assist.qt.sprites import (
     SPRITE_CANVAS,
     SPRITE_RENDER_SCALE,
@@ -57,6 +59,8 @@ class CompanionWindow(QWidget):
         self._current_pixmap: QPixmap | None = None
         self._mirrored: bool = False
         self._dragging_button = False
+        self._shiny: bool = False
+        self._shiny_phase_start: float = time.monotonic()
 
         self.on_mouse_press = None
         self.on_mouse_move = None
@@ -82,6 +86,11 @@ class CompanionWindow(QWidget):
     def set_frame(self, pixmap: QPixmap, *, mirrored: bool = False) -> None:
         self._current_pixmap = pixmap
         self._mirrored = mirrored
+        self._refresh_pixmap()
+
+    def enable_shiny(self) -> None:
+        self._shiny = True
+        self._shiny_phase_start = time.monotonic()
         self._refresh_pixmap()
 
     def set_position(self, x: int, y: int) -> None:
@@ -118,6 +127,8 @@ class CompanionWindow(QWidget):
         render_w = max(1, int(round(self._sprite_width * SPRITE_RENDER_SCALE)))
         render_h = max(1, int(round(self._sprite_height * SPRITE_RENDER_SCALE)))
         scaled = scale_frame(self._current_pixmap, render_w, render_h, mirrored=self._mirrored)
+        if self._shiny:
+            scaled = apply_shiny(scaled, time.monotonic() - self._shiny_phase_start)
         self._label.setPixmap(scaled)
 
     # ------------------------------------------------------------------

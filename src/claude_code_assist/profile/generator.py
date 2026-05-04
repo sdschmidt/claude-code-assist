@@ -453,6 +453,7 @@ async def _generate_companion_async(
         name=name,
         creature_type=str(data["creature_type"]),
         rarity=rarity,
+        shiny=rng.random() < 0.01,
         personality=str(data["personality"]),
         backstory=str(data["backstory"]),
         stats=stats,

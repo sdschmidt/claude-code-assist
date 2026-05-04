@@ -40,6 +40,14 @@ class CompanionProfile(BaseModel):
     name: str = Field(description="Generated creature name.")
     creature_type: str = Field(description="Species or creature type (e.g. axolotl, phoenix).")
     rarity: Rarity = Field(description="Rarity tier: Common, Uncommon, Rare, Epic, or Legendary.")
+    shiny: bool = Field(
+        default=False,
+        description=(
+            "Cosmetic 1-in-100 flag rolled at companion creation. When True the Qt "
+            "frontend overlays a holographic shimmer + pulsing gold halo on every "
+            "sprite frame. Purely visual — no effect on stats, rarity, or behaviour."
+        ),
+    )
     personality: str = Field(description="2-3 sentence personality summary used in commentary prompts.")
     backstory: str = Field(description="3-5 sentence origin story.")
     stats: dict[str, int] = Field(

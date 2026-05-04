@@ -156,7 +156,7 @@ def install_tray(
             _add_levelup_entry(menu, companion, on_levelup_requested)
             menu.addSeparator()
         _add_header(menu, companion)
-        _add_preview(menu, icon_pixmap)
+        _add_preview(menu, icon_pixmap, shiny=companion.shiny)
         _add_stats(menu, companion)
         _add_text_block(menu, "Bio", companion.personality)
         _add_text_block(menu, "Backstory", companion.backstory)
@@ -632,7 +632,7 @@ def _add_info_rows(
         menu.addAction(action)
 
 
-def _add_preview(menu: QMenu, icon_pixmap: QPixmap) -> None:
+def _add_preview(menu: QMenu, icon_pixmap: QPixmap, *, shiny: bool = False) -> None:
     """Idle-A sprite preview, centered, scaled large + vibrant.
 
     Three things matter:
@@ -653,13 +653,54 @@ def _add_preview(menu: QMenu, icon_pixmap: QPixmap) -> None:
 
     Sizing: ``_PREVIEW_SIZE`` logical px, square (``KeepAspectRatio``
     on a non-square crop just shrinks the longer side to fit).
+
+    When ``shiny`` is True, the preview animates: a 30 Hz ``QTimer``
+    parented to the QLabel re-runs the shiny composite at the current
+    phase. The timer is destroyed with the label on the next
+    ``menu.clear()`` and skips work while the menu is hidden, so the
+    cost between opens is a single ``isVisible()`` check per tick.
     """
     trimmed = _trim_to_visible(icon_pixmap)
     label = QLabel()
     label.setAlignment(Qt.AlignmentFlag.AlignCenter)
     label.setContentsMargins(0, 0, 0, 0)
-    _set_preview_pixmap(label, trimmed, _PREVIEW_SIZE)
+    if shiny:
+        _animate_shiny_preview(menu, label, trimmed, _PREVIEW_SIZE)
+    else:
+        _set_preview_pixmap(label, trimmed, _PREVIEW_SIZE)
     _add_widget(menu, label, enabled=True)
+
+
+def _animate_shiny_preview(menu: QMenu, label: QLabel, source: QPixmap, logical_size: int) -> None:
+    """Drive ``label`` with the shiny composite at ~30 Hz."""
+    import time  # noqa: PLC0415
+
+    from PySide6.QtCore import QTimer  # noqa: PLC0415
+
+    from claude_code_assist.qt.shiny import apply_shiny  # noqa: PLC0415
+
+    dpr = source.devicePixelRatio() or 1.0
+    physical = max(1, int(round(logical_size * dpr)))
+    base = source.scaled(
+        physical,
+        physical,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    base.setDevicePixelRatio(dpr)
+
+    start = time.monotonic()
+
+    def _tick() -> None:
+        if not menu.isVisible():
+            return
+        label.setPixmap(apply_shiny(base, time.monotonic() - start))
+
+    label.setPixmap(apply_shiny(base, 0.0))
+    timer = QTimer(label)
+    timer.setInterval(33)
+    timer.timeout.connect(_tick)
+    timer.start()
 
 
 def _set_preview_pixmap(label: QLabel, source: QPixmap, logical_size: int) -> None:
