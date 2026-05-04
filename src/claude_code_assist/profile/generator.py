@@ -80,6 +80,25 @@ _MAX_RETRIES = 3
 _RESERVED_COMPANION_NAMES = frozenset({"new", "art", "roster", "archive", "help", "default"})
 
 
+class LLMConfigError(RuntimeError):
+    """LLM call failed for a reason that retrying won't fix.
+
+    Wraps auth, missing-CLI, model-not-found, and unreachable-endpoint
+    errors with provider/model context plus a one-line hint so the user
+    knows where to look. ``_run_with_retries`` bails out immediately
+    when this is raised — retrying a misconfigured provider just adds
+    noise.
+    """
+
+
+def _provider_context(resolved: ResolvedProviderConfig) -> str:
+    """One-line ``provider=… model=… [base_url=…]`` summary for error messages."""
+    parts = [f"provider={resolved.provider.value}", f"model={resolved.model}"]
+    if resolved.base_url:
+        parts.append(f"base_url={resolved.base_url}")
+    return ", ".join(parts)
+
+
 def _extract_json_from_result(result_msg: object, context: str) -> dict[str, object]:
     """Extract and parse JSON from an Agent SDK ResultMessage."""
     structured_output = getattr(result_msg, "structured_output", None)
@@ -122,7 +141,14 @@ async def _generate_text_openai_compat(
     max_tokens: int = 4096,
 ) -> str:
     """Generate text using an OpenAI-compatible API, raising on failure."""
-    from openai import OpenAI
+    from openai import APIConnectionError, AuthenticationError, NotFoundError, OpenAI
+
+    ctx = _provider_context(resolved)
+    if resolved.api_key_env and not resolved.api_key:
+        raise LLMConfigError(
+            f"Missing API key for {resolved.provider.value} — "
+            f"set the {resolved.api_key_env} environment variable. ({ctx})"
+        )
 
     try:
         client = OpenAI(base_url=resolved.base_url, api_key=resolved.api_key or "unused")
@@ -135,17 +161,26 @@ async def _generate_text_openai_compat(
             max_tokens=max_tokens,
             timeout=120,
         )
-        choice = response.choices[0] if response.choices else None
-        if choice and choice.message and choice.message.content:
-            return choice.message.content.strip()
-        raise RuntimeError(f"OpenAI-compatible API returned no content for model={resolved.model}")
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        raise RuntimeError(
-            f"OpenAI-compatible API call failed (provider={resolved.provider}, "
-            f"model={resolved.model}, base_url={resolved.base_url}): {exc}"
+    except AuthenticationError as exc:
+        raise LLMConfigError(
+            f"Authentication failed for {resolved.provider.value}. "
+            f"Check the {resolved.api_key_env or 'API key'}. ({ctx}): {exc}"
         ) from exc
+    except NotFoundError as exc:
+        raise LLMConfigError(
+            f"Model not found on {resolved.provider.value}: {resolved.model!r}. "
+            f"Pick a different model in `companion settings`. ({ctx}): {exc}"
+        ) from exc
+    except APIConnectionError as exc:
+        hint = "Is the Ollama server running?" if resolved.provider.value == "ollama" else "Check network / base_url."
+        raise LLMConfigError(f"Could not reach {resolved.provider.value}. {hint} ({ctx}): {exc}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"OpenAI-compatible API call failed ({ctx}): {exc}") from exc
+
+    choice = response.choices[0] if response.choices else None
+    if choice and choice.message and choice.message.content:
+        return choice.message.content.strip()
+    raise RuntimeError(f"OpenAI-compatible API returned no content ({ctx})")
 
 
 async def _generate_text_gemini(
@@ -157,12 +192,14 @@ async def _generate_text_gemini(
     from google import genai
     from google.genai import types as gx
 
-    api_key = resolved.api_key
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY environment variable is required for Gemini text generation")
+    ctx = _provider_context(resolved)
+    if not resolved.api_key:
+        raise LLMConfigError(
+            f"Missing API key for gemini — set the {resolved.api_key_env} environment variable. ({ctx})"
+        )
 
     try:
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(api_key=resolved.api_key)
         config = gx.GenerateContentConfig(
             system_instruction=system_prompt,
             response_mime_type="text/plain",
@@ -172,15 +209,21 @@ async def _generate_text_gemini(
             contents=[user_prompt],
             config=config,
         )
-
-        text = response.text if hasattr(response, "text") else None
-        if text:
-            return text.strip()
-        raise RuntimeError(f"Gemini API returned no text content for model={resolved.model}")
-    except RuntimeError:
-        raise
     except Exception as exc:
-        raise RuntimeError(f"Gemini API call failed (model={resolved.model}): {exc}") from exc
+        msg = str(exc).lower()
+        if "api key" in msg or "unauthorized" in msg or "permission" in msg:
+            raise LLMConfigError(f"Gemini auth failed — check {resolved.api_key_env}. ({ctx}): {exc}") from exc
+        if "not found" in msg or "invalid model" in msg:
+            raise LLMConfigError(
+                f"Gemini model not found: {resolved.model!r}. "
+                f"Pick a different model in `companion settings`. ({ctx}): {exc}"
+            ) from exc
+        raise RuntimeError(f"Gemini API call failed ({ctx}): {exc}") from exc
+
+    text = response.text if hasattr(response, "text") else None
+    if text:
+        return text.strip()
+    raise RuntimeError(f"Gemini API returned no text content ({ctx})")
 
 
 async def _call_profile_llm(
@@ -190,10 +233,17 @@ async def _call_profile_llm(
     context: str = "LLM call",
 ) -> dict[str, object]:
     """Route profile LLM call to the configured provider and parse JSON response."""
-    resolved = config.resolved_profile_provider
+    resolved = config.resolved_provider
+    ctx = _provider_context(resolved)
 
     if resolved.uses_agent_sdk:
-        from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
+        from claude_agent_sdk import (
+            ClaudeAgentOptions,
+            CLINotFoundError,
+            ProcessError,
+            ResultMessage,
+            query,
+        )
 
         options = ClaudeAgentOptions(
             model=resolved.model,
@@ -205,17 +255,32 @@ async def _call_profile_llm(
             plugins=[],
         )
         result_msg: object | None = None
-        async for message in query(prompt=user_prompt, options=options):
-            if isinstance(message, ResultMessage):
-                result_msg = message
+        try:
+            async for message in query(prompt=user_prompt, options=options):
+                if isinstance(message, ResultMessage):
+                    result_msg = message
+        except CLINotFoundError as exc:
+            raise LLMConfigError(
+                "Claude Code CLI not found. Install it with `npm install -g @anthropic-ai/claude-code` "
+                f"or switch provider in `companion settings`. ({ctx}): {exc}"
+            ) from exc
+        except ProcessError as exc:
+            stderr = (exc.stderr or "").strip()
+            stderr_hint = f"\n  stderr: {stderr}" if stderr and stderr != "Check stderr output for details" else ""
+            raise LLMConfigError(
+                "Claude Agent SDK subprocess failed. This usually means the `claude` CLI is "
+                "missing, not authenticated (`claude login`), or the model is unavailable. "
+                f"Try `companion settings` to switch provider. ({ctx}, exit_code={exc.exit_code})"
+                f"{stderr_hint}"
+            ) from exc
 
         if result_msg is None:
-            raise RuntimeError(f"Agent SDK did not return a result for {context}")
+            raise RuntimeError(f"Agent SDK did not return a result for {context} ({ctx})")
         is_error = getattr(result_msg, "is_error", False)
         if is_error:
             errors_val = getattr(result_msg, "errors", None) or []
             errors = ", ".join(str(e) for e in errors_val) if errors_val else "unknown error"
-            raise RuntimeError(f"Agent SDK returned an error: {errors}")
+            raise RuntimeError(f"Agent SDK returned an error ({ctx}): {errors}")
 
         return _extract_json_from_result(result_msg, context)
 
@@ -231,12 +296,19 @@ async def _call_profile_llm(
 
 
 def _run_with_retries(fn: object, *args: object, context: str = "Operation") -> object:
-    """Run an async function via asyncio.run with retry logic."""
+    """Run an async function via asyncio.run with retry logic.
+
+    ``LLMConfigError`` is re-raised immediately — retrying a misconfigured
+    provider (missing API key, wrong model, dead endpoint) just produces
+    the same failure three times.
+    """
     last_error: Exception | None = None
     attempt = 0
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
             return asyncio.run(fn(*args))  # type: ignore[operator]
+        except LLMConfigError:
+            raise
         except Exception as exc:
             last_error = exc
             logger.warning("%s attempt %d/%d failed: %s", context, attempt, _MAX_RETRIES, exc)

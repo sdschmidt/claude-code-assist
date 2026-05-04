@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -129,9 +130,9 @@ def encode_project_path(project_path: str) -> str:
         project_path: Absolute project directory path.
 
     Returns:
-        Encoded path with slashes replaced by dashes.
+        Encoded path with ``/``, ``_``, and ``.`` replaced by ``-``.
     """
-    return project_path.replace("/", "-")
+    return re.sub(r"[/_.]", "-", project_path)
 
 
 def find_newest_session(session_dir: Path) -> Path | None:

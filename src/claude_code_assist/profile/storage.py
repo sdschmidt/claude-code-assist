@@ -430,7 +430,6 @@ def _migrate_profile_to_json(companion_subdir: Path) -> bool:
     if not isinstance(data, dict):
         return False
 
-    data.pop("ascii_art", None)
     data.pop("project_path", None)
 
     try:

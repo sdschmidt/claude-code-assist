@@ -243,7 +243,7 @@ def _call_llm(system_prompt: str, user_prompt: str, config: CompanionConfig, *, 
     from claude_code_assist.config import LLMProvider
     from claude_code_assist.llm_client import generate_text_openai_compat
 
-    resolved = config.resolved_commentary_provider
+    resolved = config.resolved_provider
 
     response: str | None
     if resolved.uses_agent_sdk:

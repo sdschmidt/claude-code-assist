@@ -1,9 +1,14 @@
-"""``companion settings`` — edit the tray-toggle settings from the CLI.
+"""``companion settings`` — edit companion configuration from the CLI.
 
-Mirrors the toggles available in the tray menu (gravity, walking,
-scale) so users can change them without having the Qt companion
-running. Persisted via :class:`SettingsStore` to the same
-``settings`` block in ``config.json`` that the tray writes to.
+Two persistence layers live in the same ``config.json`` file:
+
+- The tray-toggle block (``settings`` key) is owned by
+  :class:`SettingsStore` in ``qt/settings.py``. Gravity, walking, scale,
+  and the prompt-log toggles live here.
+- The model-field block (everything else, including ``provider_config``)
+  is owned by :class:`CompanionConfig`. The LLM provider/model picker
+  writes here via :func:`save_config`, which preserves the tray block
+  on round-trip.
 
 The scale picker snaps to the same 80 %–200 % / 20 % grid the tray
 slider uses (see ``qt/tray.py::_SCALE_PCT_*``); keeping the two ranges
@@ -21,6 +26,15 @@ import questionary
 from rich.console import Console
 
 from claude_code_assist.cli._picker import PICKER_STYLE, bind_shortcuts, menu_title
+from claude_code_assist.config import (
+    PROVIDER_MODEL_DEFAULTS,
+    CompanionConfig,
+    LLMProvider,
+    ProviderConfig,
+    default_model_for,
+    load_config,
+    save_config,
+)
 from claude_code_assist.qt.settings import CompanionSettings, SettingsStore
 
 logger = logging.getLogger(__name__)
@@ -30,11 +44,13 @@ _SCALE_PCT_MIN = 80
 _SCALE_PCT_MAX = 200
 _SCALE_PCT_STEP = 20
 
+_CUSTOM_MODEL_SENTINEL = "__custom__"
+
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="companion settings",
-        description="Edit companion settings (gravity, walking, scale).",
+        description="Edit companion settings (LLM provider, gravity, walking, scale).",
     )
     parser.add_argument(
         "--config-dir",
@@ -98,8 +114,79 @@ def _edit_scale(settings: CompanionSettings) -> bool:
     return True
 
 
+def _edit_provider(config: CompanionConfig) -> bool:
+    """Pick a provider. Resets model to the new provider's default."""
+    current = config.provider_config.provider
+    choices = [
+        questionary.Choice(
+            title=f"{p.value}{'  ← current' if p == current else ''}",
+            value=p.value,
+        )
+        for p in LLMProvider
+    ]
+    try:
+        chosen = questionary.select("LLM provider:", choices=choices, style=PICKER_STYLE).ask()
+    except (KeyboardInterrupt, EOFError):
+        return False
+    if chosen is None:
+        return False
+    new_provider = LLMProvider(chosen)
+    if new_provider == current:
+        return False
+    # Reset model to empty so resolve() picks the new provider's default.
+    # The user can then customise via the model picker.
+    config.provider_config = ProviderConfig(provider=new_provider, model="")
+    return True
+
+
+def _edit_model(config: CompanionConfig) -> bool:
+    """Pick a model from the provider's curated list, or enter a custom string."""
+    provider = config.provider_config.provider
+    current = config.provider_config.model or default_model_for(provider)
+    curated = PROVIDER_MODEL_DEFAULTS[provider]
+
+    choices: list[questionary.Choice] = [
+        questionary.Choice(
+            title=f"{m}{'  ← current' if m == current else ''}",
+            value=m,
+        )
+        for m in curated
+    ]
+    if current not in curated:
+        choices.append(questionary.Choice(title=f"{current}  ← current (custom)", value=current))
+    choices.append(questionary.Choice(title="Custom…", value=_CUSTOM_MODEL_SENTINEL))
+
+    try:
+        chosen = questionary.select(f"Model for {provider.value}:", choices=choices, style=PICKER_STYLE).ask()
+    except (KeyboardInterrupt, EOFError):
+        return False
+    if chosen is None:
+        return False
+
+    if chosen == _CUSTOM_MODEL_SENTINEL:
+        try:
+            entered = questionary.text(
+                "Model name:",
+                default=current,
+            ).ask()
+        except (KeyboardInterrupt, EOFError):
+            return False
+        if entered is None:
+            return False
+        chosen = entered.strip()
+        if not chosen:
+            return False
+
+    if chosen == config.provider_config.model:
+        return False
+    config.provider_config = ProviderConfig(provider=provider, model=chosen)
+    return True
+
+
 # (value, shortcut, label).
 _SETTINGS_ROWS: tuple[tuple[str, str, str], ...] = (
+    ("provider", "p", "provider"),
+    ("model", "m", "model"),
     ("gravity", "g", "gravity"),
     ("walking", "w", "walking"),
     ("scale", "s", "scale"),
@@ -109,7 +196,7 @@ _SETTINGS_ROWS: tuple[tuple[str, str, str], ...] = (
 )
 
 
-def _row_description(value: str, settings: CompanionSettings) -> str:
+def _row_description(value: str, settings: CompanionSettings, config: CompanionConfig) -> str:
     if value == "scale":
         return f"{int(round(settings.companion_scale * 100))}%"
     if value == "gravity":
@@ -122,13 +209,19 @@ def _row_description(value: str, settings: CompanionSettings) -> str:
         return _format_bool(settings.art_prompt_log)
     if value == "creation_prompt_log":
         return _format_bool(settings.creation_prompt_log)
+    if value == "provider":
+        return config.provider_config.provider.value
+    if value == "model":
+        return config.provider_config.model or default_model_for(config.provider_config.provider)
     return ""
 
 
-def _menu_choices(settings: CompanionSettings) -> tuple[list[questionary.Choice], dict[str, str]]:
+def _menu_choices(
+    settings: CompanionSettings, config: CompanionConfig
+) -> tuple[list[questionary.Choice], dict[str, str]]:
     choices: list[questionary.Choice] = [
         questionary.Choice(
-            title=menu_title(label, _row_description(value, settings), shortcut=key),
+            title=menu_title(label, _row_description(value, settings, config), shortcut=key),
             value=value,
         )
         for value, key, label in _SETTINGS_ROWS
@@ -147,13 +240,19 @@ def run(argv: list[str]) -> int:
     )
 
     config_dir = _resolve_config_dir(args.config_dir)
+    config_path = config_dir / "config.json"
+
     store = SettingsStore(config_dir)
     settings = store.load()
+    config = load_config(config_path)
+    # Pin config_dir so save_config writes back to the right place even
+    # when the loaded file didn't carry one.
+    config.config_dir = config_dir
 
-    console.print("[bold]Companion settings[/bold]  [dim](more providers coming later)[/dim]")
+    console.print("[bold]Companion settings[/bold]")
 
     while True:
-        choices, shortcut_map = _menu_choices(settings)
+        choices, shortcut_map = _menu_choices(settings, config)
         try:
             question = questionary.select(
                 "Pick a setting to change:",
@@ -167,24 +266,32 @@ def run(argv: list[str]) -> int:
 
         if choice is None or choice == "quit":
             store.save(settings)
+            save_config(config, config_path)
             return 0
 
-        changed = False
+        settings_changed = False
+        config_changed = False
         if choice == "gravity":
-            changed = _toggle_gravity(settings)
+            settings_changed = _toggle_gravity(settings)
         elif choice == "walking":
-            changed = _toggle_walking(settings)
+            settings_changed = _toggle_walking(settings)
         elif choice == "scale":
-            changed = _edit_scale(settings)
+            settings_changed = _edit_scale(settings)
         elif choice == "commentary_prompt_log":
             settings.commentary_prompt_log = not settings.commentary_prompt_log
-            changed = True
+            settings_changed = True
         elif choice == "art_prompt_log":
             settings.art_prompt_log = not settings.art_prompt_log
-            changed = True
+            settings_changed = True
         elif choice == "creation_prompt_log":
             settings.creation_prompt_log = not settings.creation_prompt_log
-            changed = True
+            settings_changed = True
+        elif choice == "provider":
+            config_changed = _edit_provider(config)
+        elif choice == "model":
+            config_changed = _edit_model(config)
 
-        if changed:
+        if settings_changed:
             store.save(settings)
+        if config_changed:
+            save_config(config, config_path)

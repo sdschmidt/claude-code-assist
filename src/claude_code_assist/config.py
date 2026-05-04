@@ -8,7 +8,7 @@ import os
 import time
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
@@ -20,9 +20,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # LLM Provider system
 # ---------------------------------------------------------------------------
-
-# Pipeline type determines which model default to use (text vs image)
-PipelineType = Literal["text", "image"]
 
 
 class LLMProvider(StrEnum):
@@ -42,64 +39,33 @@ _CLAUDE_MODEL_ALIASES: dict[str, str] = {
     "opus": "claude-opus-4-6-20250514",
 }
 
-# Provider defaults keyed by (provider, pipeline_type)
-_PROVIDER_DEFAULTS: dict[tuple[LLMProvider, PipelineType], dict[str, str]] = {
-    # Claude — text only (Agent SDK handles auth)
-    (LLMProvider.CLAUDE, "text"): {
-        "model": "claude-haiku-4-5",
-        "base_url": "",
-        "api_key_env": "",
-    },
-    (LLMProvider.CLAUDE, "image"): {
-        "model": "claude-haiku-4-5",
-        "base_url": "",
-        "api_key_env": "",
-    },
-    # Ollama — local, no real API key needed
-    (LLMProvider.OLLAMA, "text"): {
-        "model": "llama3.2",
-        "base_url": "http://localhost:11434/v1",
-        "api_key_env": "",
-    },
-    (LLMProvider.OLLAMA, "image"): {
-        "model": "llama3.2",
-        "base_url": "http://localhost:11434/v1",
-        "api_key_env": "",
-    },
-    # OpenAI
-    (LLMProvider.OPENAI, "text"): {
-        "model": "gpt-4o",
-        "base_url": "https://api.openai.com/v1",
-        "api_key_env": "OPENAI_API_KEY",
-    },
-    (LLMProvider.OPENAI, "image"): {
-        "model": "gpt-image-1.5",
-        "base_url": "https://api.openai.com/v1",
-        "api_key_env": "OPENAI_API_KEY",
-    },
-    # OpenRouter
-    (LLMProvider.OPENROUTER, "text"): {
-        "model": "anthropic/claude-haiku-4-5",
-        "base_url": "https://openrouter.ai/api/v1",
-        "api_key_env": "OPENROUTER_API_KEY",
-    },
-    (LLMProvider.OPENROUTER, "image"): {
-        "model": "openai/dall-e-3",
-        "base_url": "https://openrouter.ai/api/v1",
-        "api_key_env": "OPENROUTER_API_KEY",
-    },
-    # Gemini
-    (LLMProvider.GEMINI, "text"): {
-        "model": "gemini-2.5-flash",
-        "base_url": "",
-        "api_key_env": "GEMINI_API_KEY",
-    },
-    (LLMProvider.GEMINI, "image"): {
-        "model": "gemini-3.1-flash-image-preview",
-        "base_url": "",
-        "api_key_env": "GEMINI_API_KEY",
-    },
+# Curated default model lists per provider — surfaced in the CLI picker.
+# First entry is treated as the provider's default if the user hasn't picked one.
+PROVIDER_MODEL_DEFAULTS: dict[LLMProvider, tuple[str, ...]] = {
+    LLMProvider.CLAUDE: ("haiku", "sonnet", "opus"),
+    LLMProvider.OPENAI: ("gpt-5", "gpt-4o", "gpt-4o-mini"),
+    LLMProvider.OPENROUTER: (
+        "anthropic/claude-haiku-4-5",
+        "anthropic/claude-sonnet-4-6",
+        "openai/gpt-4o",
+    ),
+    LLMProvider.GEMINI: ("gemini-2.5-flash", "gemini-2.5-pro"),
+    LLMProvider.OLLAMA: ("llama3.2", "qwen2.5", "mistral"),
 }
+
+# Per-provider connection defaults (base_url + which env var holds the API key).
+_PROVIDER_CONNECTION_DEFAULTS: dict[LLMProvider, dict[str, str]] = {
+    LLMProvider.CLAUDE: {"base_url": "", "api_key_env": ""},
+    LLMProvider.OLLAMA: {"base_url": "http://localhost:11434/v1", "api_key_env": ""},
+    LLMProvider.OPENAI: {"base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY"},
+    LLMProvider.OPENROUTER: {"base_url": "https://openrouter.ai/api/v1", "api_key_env": "OPENROUTER_API_KEY"},
+    LLMProvider.GEMINI: {"base_url": "", "api_key_env": "GEMINI_API_KEY"},
+}
+
+
+def default_model_for(provider: LLMProvider) -> str:
+    """First curated model for a provider — used when the user hasn't picked one."""
+    return PROVIDER_MODEL_DEFAULTS[provider][0]
 
 
 def resolve_api_key(provider: LLMProvider, api_key_env: str) -> str | None:
@@ -121,35 +87,32 @@ def resolve_api_key(provider: LLMProvider, api_key_env: str) -> str | None:
     return None
 
 
-class PipelineProviderConfig(BaseModel):
-    """Provider configuration for a single LLM pipeline."""
+class ProviderConfig(BaseModel):
+    """User-facing LLM provider selection.
+
+    Stores only the provider + model the user picked. Connection
+    details (base_url, api_key_env) are derived per-provider on
+    resolve, so switching providers doesn't require re-typing them.
+    """
 
     provider: LLMProvider = LLMProvider.CLAUDE
     model: str = ""
-    base_url: str = ""
-    api_key_env: str = ""
 
-    def resolve(self, pipeline: PipelineType = "text") -> ResolvedProviderConfig:
-        """Fill in provider-specific defaults for any empty fields.
+    def resolve(self) -> ResolvedProviderConfig:
+        """Fill in defaults: provider's first curated model if model is empty,
+        plus connection details (base_url, api_key_env)."""
+        connection = _PROVIDER_CONNECTION_DEFAULTS[self.provider]
+        resolved_model = self.model or default_model_for(self.provider)
 
-        Args:
-            pipeline: Whether this is a "text" or "image" pipeline (affects default model).
-
-        Returns:
-            Fully resolved config with all fields populated.
-        """
-        defaults = _PROVIDER_DEFAULTS.get((self.provider, pipeline), {})
-        resolved_model = self.model or defaults.get("model", "")
-
-        # Resolve Claude model aliases
+        # Resolve Claude model aliases (haiku/sonnet/opus → full IDs)
         if self.provider == LLMProvider.CLAUDE:
             resolved_model = _CLAUDE_MODEL_ALIASES.get(resolved_model.lower().strip(), resolved_model)
 
         return ResolvedProviderConfig(
             provider=self.provider,
             model=resolved_model,
-            base_url=self.base_url or defaults.get("base_url", ""),
-            api_key_env=self.api_key_env or defaults.get("api_key_env", ""),
+            base_url=connection["base_url"],
+            api_key_env=connection["api_key_env"],
         )
 
 
@@ -175,27 +138,6 @@ class ResolvedProviderConfig(BaseModel):
     def uses_agent_sdk(self) -> bool:
         """Whether this provider uses the Claude Agent SDK."""
         return self.provider == LLMProvider.CLAUDE
-
-
-# ---------------------------------------------------------------------------
-# Display enums
-# ---------------------------------------------------------------------------
-
-
-class ArtMode(StrEnum):
-    """Supported display modes for companion art."""
-
-    ASCII = "ascii"
-    SIXEL_ART = "sixel-art"
-    MACOS_DESKTOP = "macos-desktop"
-
-
-class BubblePlacement(StrEnum):
-    """Position of the speech bubble relative to the companion art."""
-
-    TOP = "top"
-    RIGHT = "right"
-    BOTTOM = "bottom"
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +181,6 @@ class CompanionConfig(BaseModel):
     max_idle_length: int = 150
 
     # Animation
-    ascii_art_frames: int = 6
     idle_duration_seconds: float = 3.0
     reaction_duration_seconds: float = 0.5
     sleep_duration_seconds: float = 60.0
@@ -249,39 +190,14 @@ class CompanionConfig(BaseModel):
     log_level: str = "WARNING"
     log_file: str = "debug.log"
 
-    # --- Per-pipeline LLM provider configs ---
-    profile_provider_config: PipelineProviderConfig = Field(
-        default_factory=PipelineProviderConfig,
-        description="Provider for companion profile generation and ASCII art regeneration.",
-    )
-    commentary_provider_config: PipelineProviderConfig = Field(
-        default_factory=PipelineProviderConfig,
-        description="Provider for commentary and idle chatter generation.",
-    )
-    image_art_provider_config: PipelineProviderConfig = Field(
-        default_factory=lambda: PipelineProviderConfig(provider=LLMProvider.OPENAI),
-        description="Provider for sixel-art image generation.",
+    # --- Single global LLM provider (shared by commentary + profile) ---
+    provider_config: ProviderConfig = Field(
+        default_factory=ProviderConfig,
+        description="LLM provider for commentary and profile generation. Image art uses Gemini directly.",
     )
 
-    # Art mode
-    art_mode: ArtMode = Field(default=ArtMode.ASCII, description="Display mode: ascii or sixel-art.")
-    art_max_width_pct: int = Field(
-        default=40, description="Percentage of terminal width allocated to the art panel (1-100)."
-    )
+    # Art
     art_size: int = Field(default=120, description="Target pixel height for art sprites. Must be a multiple of 6.")
-    halfblock_size: int = Field(
-        default=48,
-        description=(
-            "Target pixel height for sixel-art half-block rendering. Must be even; each terminal row covers 2 pixels."
-        ),
-    )
-    chroma_tolerance: int = Field(
-        default=30,
-        description=(
-            "Tolerance for chroma key background removal during art processing (0-255). "
-            "Higher values remove more of the background color."
-        ),
-    )
     art_dir_path: str = Field(
         default="art", description="Subdirectory name under config_dir where art frame files are stored."
     )
@@ -294,28 +210,12 @@ class CompanionConfig(BaseModel):
         ),
     )
 
-    # Display
-    bubble_placement: BubblePlacement = Field(
-        default=BubblePlacement.BOTTOM,
-        description="Speech bubble position relative to companion art: top, right, or bottom.",
-    )
-
-    # --- Resolved provider convenience properties ---
+    # --- Resolved provider convenience property ---
 
     @property
-    def resolved_profile_provider(self) -> ResolvedProviderConfig:
-        """Resolved provider config for profile/art regeneration pipeline."""
-        return self.profile_provider_config.resolve("text")
-
-    @property
-    def resolved_commentary_provider(self) -> ResolvedProviderConfig:
-        """Resolved provider config for commentary pipeline."""
-        return self.commentary_provider_config.resolve("text")
-
-    @property
-    def resolved_image_art_provider(self) -> ResolvedProviderConfig:
-        """Resolved provider config for image art pipeline."""
-        return self.image_art_provider_config.resolve("image")
+    def resolved_provider(self) -> ResolvedProviderConfig:
+        """Resolved LLM provider config used by commentary and profile generation."""
+        return self.provider_config.resolve()
 
     @field_validator("log_file")
     @classmethod
@@ -366,6 +266,19 @@ class CompanionConfig(BaseModel):
 # Fields the runtime sets that we don't want in the persisted file.
 _EXCLUDE_FROM_FILE = {"config_dir"}
 
+# Legacy keys silently dropped on load — replaced by `provider_config`.
+_LEGACY_DROPPED_KEYS = {
+    "profile_provider_config",
+    "commentary_provider_config",
+    "image_art_provider_config",
+    "art_mode",
+    "ascii_art_frames",
+    "art_max_width_pct",
+    "halfblock_size",
+    "chroma_tolerance",
+    "bubble_placement",
+}
+
 
 def save_config(config: CompanionConfig, path: Path) -> None:
     """Save configuration to ``config.json``, preserving unknown keys.
@@ -389,6 +302,10 @@ def save_config(config: CompanionConfig, path: Path) -> None:
             logger.warning("Could not read existing %s; rewriting from scratch", path, exc_info=True)
             existing = {}
 
+    # Drop legacy keys so they don't keep round-tripping through the file.
+    for key in _LEGACY_DROPPED_KEYS:
+        existing.pop(key, None)
+
     data = config.model_dump(mode="json", exclude=_EXCLUDE_FROM_FILE)
     if "rarity_weights" in data:
         data["rarity_weights"] = {str(k): v for k, v in data["rarity_weights"].items()}
@@ -407,6 +324,7 @@ def load_config(path: Path) -> CompanionConfig:
 
     Unknown keys (notably the tray-managed ``settings`` block) are
     ignored by the model — they're preserved on save by ``save_config``.
+    Legacy provider/art keys are silently dropped.
     """
     if not path.exists():
         logger.debug("Config file not found at %s, using defaults", path)
@@ -418,8 +336,7 @@ def load_config(path: Path) -> CompanionConfig:
         if not isinstance(data, dict):
             logger.warning("Top-level config in %s is not an object; using defaults", path)
             return CompanionConfig()
-        # Drop the tray-settings block and convert rarity keys.
-        data = {k: v for k, v in data.items() if k != "settings"}
+        data = {k: v for k, v in data.items() if k != "settings" and k not in _LEGACY_DROPPED_KEYS}
         if "rarity_weights" in data:
             data["rarity_weights"] = {Rarity(k): v for k, v in data["rarity_weights"].items()}
         return CompanionConfig(**data)
