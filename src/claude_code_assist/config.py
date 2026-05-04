@@ -283,11 +283,10 @@ _LEGACY_DROPPED_KEYS = {
 def save_config(config: CompanionConfig, path: Path) -> None:
     """Save configuration to ``config.json``, preserving unknown keys.
 
-    The tray-toggle settings (``settings`` sub-object) are owned by
-    :class:`SettingsStore` in ``qt/settings.py``, which mutates the same
-    file. To avoid clobbering them when ``companion new`` writes the
-    rest of the config, we read the existing file first, layer the
-    model fields on top, and write the merged result.
+    Drops the legacy ``settings`` sub-object on write — that data now
+    lives in ``settings.json`` (owned by :class:`SettingsStore`) and is
+    migrated out the first time :meth:`SettingsStore.load` runs against
+    an old config dir.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     existing: dict[str, Any] = {}
@@ -302,29 +301,25 @@ def save_config(config: CompanionConfig, path: Path) -> None:
             logger.warning("Could not read existing %s; rewriting from scratch", path, exc_info=True)
             existing = {}
 
-    # Drop legacy keys so they don't keep round-tripping through the file.
+    # Drop legacy keys (including the old settings block) so they don't
+    # keep round-tripping through the file.
     for key in _LEGACY_DROPPED_KEYS:
         existing.pop(key, None)
+    existing.pop("settings", None)
 
     data = config.model_dump(mode="json", exclude=_EXCLUDE_FROM_FILE)
     if "rarity_weights" in data:
         data["rarity_weights"] = {str(k): v for k, v in data["rarity_weights"].items()}
 
     merged = {**existing, **data}
-    # The tray-managed ``settings`` block is preserved unless ``data`` set
-    # it explicitly (which the model never does — it's owned elsewhere).
-    if "settings" in existing and "settings" not in data:
-        merged["settings"] = existing["settings"]
-
     path.write_text(json.dumps(merged, indent=2), encoding="utf-8")
 
 
 def load_config(path: Path) -> CompanionConfig:
     """Load configuration from ``config.json``, falling back to defaults.
 
-    Unknown keys (notably the tray-managed ``settings`` block) are
-    ignored by the model — they're preserved on save by ``save_config``.
-    Legacy provider/art keys are silently dropped.
+    The legacy ``settings`` sub-object and other dropped keys are
+    silently ignored — they're owned elsewhere or no longer used.
     """
     if not path.exists():
         logger.debug("Config file not found at %s, using defaults", path)

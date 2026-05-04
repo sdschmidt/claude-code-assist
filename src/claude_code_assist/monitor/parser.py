@@ -2,7 +2,7 @@
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +118,13 @@ class SessionEvent:
     tool-result feedback (no human text). Lets the coalescer
     distinguish a real human message (which closes a turn) from a
     tool-result coming back from the assistant's prior tool_use."""
+    touched_paths: list[str] = field(default_factory=list)
+    """File paths the assistant edited / wrote / created in this turn,
+    extracted from ``Edit`` / ``Write`` / ``MultiEdit`` / ``NotebookEdit``
+    tool_use blocks. Absolute paths as the SDK reports them. Used by
+    :mod:`commentary.changes` to attach diffs to the user prompt;
+    coalesced (de-duped, order-preserving) when the turn coalescer
+    merges multi-block turns."""
 
 
 def _extract_user_text(content: str | list[dict[str, object]]) -> str:
@@ -149,6 +156,37 @@ def _extract_user_text(content: str | list[dict[str, object]]) -> str:
                 parts.append(f"[result: {preview}]" if preview else "[result]")
 
     return " ".join(parts)
+
+
+_FILE_EDITING_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
+
+
+def _extract_touched_paths(content: str | list[dict[str, object]]) -> list[str]:
+    """Pull file paths from edit/write tool_use blocks, in arrival order.
+
+    Reads/Greps/Globs intentionally do *not* count as touched — the
+    diff layer only wants paths the assistant actually changed.
+    De-duped while preserving first-seen order so a multi-block turn
+    that edits the same file twice surfaces it once.
+    """
+    if not isinstance(content, list):
+        return []
+    seen: set[str] = set()
+    paths: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        if str(block.get("name", "")) not in _FILE_EDITING_TOOLS:
+            continue
+        raw_input = block.get("input", {})
+        if not isinstance(raw_input, dict):
+            continue
+        path = str(raw_input.get("file_path", "")).strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        paths.append(path)
+    return paths
 
 
 def _extract_assistant_text(content: str | list[dict[str, object]]) -> str:
@@ -209,6 +247,7 @@ def parse_jsonl_line(line: str) -> SessionEvent | None:
     content = message.get("content", "")
 
     is_tool_result = False
+    touched_paths: list[str] = []
     if role == "user":
         summary = _truncate(_extract_user_text(content))
         # If every block in the user content is a tool_result, this is
@@ -217,6 +256,7 @@ def parse_jsonl_line(line: str) -> SessionEvent | None:
             is_tool_result = all(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
     elif role == "assistant":
         summary = _truncate(_extract_assistant_text(content))
+        touched_paths = _extract_touched_paths(content)
     else:
         return None
 
@@ -231,4 +271,5 @@ def parse_jsonl_line(line: str) -> SessionEvent | None:
         summary=summary,
         timestamp=timestamp,
         is_tool_result=is_tool_result,
+        touched_paths=touched_paths,
     )

@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from queue import Empty, Queue
 from typing import TYPE_CHECKING
 
@@ -34,7 +35,6 @@ from claude_code_assist.monitor.watcher import SessionWatcher, encode_project_pa
 
 if TYPE_CHECKING:
     from concurrent.futures import Future
-    from pathlib import Path
 
     from claude_code_assist.config import CompanionConfig
     from claude_code_assist.models.companion import CompanionProfile
@@ -102,13 +102,18 @@ class CommentaryBackend:
         self._companion = companion
         self._event_queue: Queue[SessionEvent] = Queue()
 
+        # ``cwd`` is the project root the user launched ``companion``
+        # from. The diff layer (:mod:`commentary.changes`) needs it to
+        # run ``git diff`` for paths the assistant edited. ``None`` when
+        # text-watcher mode is in use — the change-context block stays
+        # empty in that case.
+        self._cwd: Path | None = Path(project_path) if project_path and follow_file is None else None
+
         self._watcher: SessionWatcher | TextFileWatcher
         if follow_file is not None:
             logger.info("Following text file: %s", follow_file)
             self._watcher = TextFileWatcher(file_path=follow_file, event_queue=self._event_queue)
         else:
-            from pathlib import Path
-
             session_dir = watch_dir or (Path.home() / ".claude" / "projects" / encode_project_path(project_path))
             logger.info("Watching Claude session dir: %s", session_dir)
             self._watcher = SessionWatcher(session_dir=session_dir, event_queue=self._event_queue)
@@ -191,6 +196,7 @@ class CommentaryBackend:
                 config=self._config,
                 max_length=self._config.max_comment_length,
                 recent_events=list(self._recent_events[:-1]),
+                cwd=self._cwd,
             )
             return True
 
@@ -202,6 +208,7 @@ class CommentaryBackend:
                 config=self._config,
                 max_length=self._config.max_comment_length,
                 recent_events=list(self._recent_events[:-1]),
+                cwd=self._cwd,
             )
             return True
 
@@ -298,6 +305,7 @@ class CommentaryBackend:
                     config=self._config,
                     max_length=self._config.max_comment_length,
                     recent_events=prior_events,
+                    cwd=self._cwd,
                 )
             elif (
                 self._pending_comment is None
@@ -310,6 +318,7 @@ class CommentaryBackend:
                     config=self._config,
                     max_length=self._config.max_comment_length,
                     recent_events=prior_events,
+                    cwd=self._cwd,
                 )
 
         # 4. Idle chatter when the session has gone quiet.

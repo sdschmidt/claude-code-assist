@@ -427,6 +427,15 @@ def main(argv: list[str] | None = None) -> int:
         window.set_scale(scale)
         bubble.set_scale(scale)
 
+    def _on_edit_prompts() -> None:
+        from claude_code_assist.qt.prompt_overrides_dialog import PromptOverridesDialog  # noqa: PLC0415
+
+        dialog = PromptOverridesDialog(
+            companion,
+            on_save=lambda: save_profile(companion, profile_path),
+        )
+        dialog.exec()
+
     def _on_levelup_requested() -> None:
         from claude_code_assist.qt.levelup_dialog import LevelUpDialog  # noqa: PLC0415
 
@@ -469,6 +478,7 @@ def main(argv: list[str] | None = None) -> int:
         on_walking_toggled=_set_walking,
         on_scale_changed=_set_scale,
         on_levelup_requested=_on_levelup_requested,
+        on_edit_prompts=_on_edit_prompts,
     )
 
     # Mouse → controller. The controller owns position; the view just relays

@@ -245,13 +245,16 @@ async def _call_profile_llm(
             query,
         )
 
+        from claude_code_assist.qt.settings import SettingsStore, settings_to_sdk_arg
+
+        setting_sources = settings_to_sdk_arg(SettingsStore(config.config_dir).load().claude_setting_sources)
         options = ClaudeAgentOptions(
             model=resolved.model,
             system_prompt=system_prompt,
             allowed_tools=[],
             max_turns=1,
             permission_mode="dontAsk",
-            setting_sources=[],
+            setting_sources=setting_sources,
             plugins=[],
         )
         result_msg: object | None = None

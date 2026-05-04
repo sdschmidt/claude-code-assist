@@ -113,6 +113,7 @@ def install_tray(
     on_walking_toggled: Callable[[bool], None] | None = None,
     on_scale_changed: Callable[[float], None] | None = None,
     on_levelup_requested: Callable[[], None] | None = None,
+    on_edit_prompts: Callable[[], None] | None = None,
 ) -> QSystemTrayIcon:
     """Install the tray icon + full menu. Caller keeps the returned ref alive.
 
@@ -199,6 +200,14 @@ def install_tray(
         menu.addAction(walk_action)
 
         _add_scale_slider(menu, settings, settings_store, on_scale_changed)
+
+        # Settings submenu — currently just the prompt-overrides
+        # editor, but a natural home for future per-companion knobs.
+        if on_edit_prompts is not None:
+            settings_menu = menu.addMenu("Settings")
+            edit_prompts_action = QAction("Overwrite prompts…", settings_menu)
+            edit_prompts_action.triggered.connect(on_edit_prompts)
+            settings_menu.addAction(edit_prompts_action)
 
         menu.addSeparator()
 

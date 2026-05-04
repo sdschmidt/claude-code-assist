@@ -114,12 +114,20 @@ def _coalesce(events: list[SessionEvent]) -> SessionEvent | None:
     summary = " ".join(parts)
     if len(summary) > MAX_SUMMARY_LENGTH:
         summary = summary[: MAX_SUMMARY_LENGTH - 1] + "…"
+    seen: set[str] = set()
+    touched_paths: list[str] = []
+    for ev in events:
+        for path in ev.touched_paths:
+            if path and path not in seen:
+                seen.add(path)
+                touched_paths.append(path)
     return SessionEvent(
         event_type=events[0].event_type,
         role=role,
         summary=summary,
         timestamp=events[-1].timestamp,
         is_tool_result=False,
+        touched_paths=touched_paths,
     )
 
 

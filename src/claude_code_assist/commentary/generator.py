@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
 from claude_code_assist.commentary import transcript
+from claude_code_assist.commentary.changes import build_change_context_block
 from claude_code_assist.commentary.prompts import (
     MEMORY_MAX_LENGTH,
     RECENT_COMMENTS_MAX,
@@ -25,6 +26,8 @@ from claude_code_assist.commentary.prompts import (
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from claude_code_assist.config import CompanionConfig
     from claude_code_assist.models.companion import CompanionProfile
     from claude_code_assist.monitor.parser import SessionEvent
@@ -151,7 +154,12 @@ def _clean_comment(text: str, max_length: int) -> str | None:
     return first_line
 
 
-async def _generate_text_claude(system_prompt: str, user_prompt: str, model: str) -> str | None:
+async def _generate_text_claude(
+    system_prompt: str,
+    user_prompt: str,
+    model: str,
+    setting_sources: list[str] | None,
+) -> str | None:
     """Run a single-turn Agent SDK query and return the result text.
 
     The generator returned by ``query()`` spawns a Claude subprocess
@@ -167,7 +175,7 @@ async def _generate_text_claude(system_prompt: str, user_prompt: str, model: str
         allowed_tools=[],
         max_turns=1,
         permission_mode="dontAsk",
-        setting_sources=[],
+        setting_sources=setting_sources,
         plugins=[],
     )
 
@@ -242,12 +250,14 @@ def _call_llm(system_prompt: str, user_prompt: str, config: CompanionConfig, *, 
     """
     from claude_code_assist.config import LLMProvider
     from claude_code_assist.llm_client import generate_text_openai_compat
+    from claude_code_assist.qt.settings import SettingsStore, settings_to_sdk_arg
 
     resolved = config.resolved_provider
 
     response: str | None
     if resolved.uses_agent_sdk:
-        response = asyncio.run(_generate_text_claude(system_prompt, user_prompt, resolved.model))
+        setting_sources = settings_to_sdk_arg(SettingsStore(config.config_dir).load().claude_setting_sources)
+        response = asyncio.run(_generate_text_claude(system_prompt, user_prompt, resolved.model, setting_sources))
     elif resolved.is_openai_compat:
         response = generate_text_openai_compat(system_prompt, user_prompt, resolved)
     elif resolved.provider == LLMProvider.GEMINI:
@@ -287,15 +297,23 @@ def _run_generate_comment(
     config: CompanionConfig,
     max_length: int,
     recent_events: list[SessionEvent],
+    cwd: Path | None,
 ) -> str | None:
-    """Blocking worker — runs in a background thread."""
+    """Blocking worker — runs in a background thread.
+
+    The change-context build (``git diff`` + file reads) is blocking
+    I/O and so lives here, never on the Qt main thread.
+    """
     try:
+        change_context = build_change_context_block(event.touched_paths, cwd)
         raw = _call_llm(
             system_prompt=build_system_prompt(companion, max_comment_length=max_length),
             user_prompt=build_event_prompt(
                 event,
+                companion=companion,
                 recent_events=recent_events,
                 recent_comments=_recent_comments_for(companion),
+                change_context=change_context,
             ),
             config=config,
             kind="event",
@@ -312,6 +330,7 @@ def _run_generate_idle_chatter(companion: CompanionProfile, config: CompanionCon
         raw = _call_llm(
             system_prompt=build_system_prompt(companion, max_comment_length=max_length),
             user_prompt=build_idle_prompt(
+                companion=companion,
                 recent_comments=_recent_comments_for(companion),
                 max_length=max_length,
             ),
@@ -330,6 +349,7 @@ def generate_comment(
     config: CompanionConfig,
     max_length: int = 150,
     recent_events: list[SessionEvent] | None = None,
+    cwd: Path | None = None,
 ) -> str | None:
     """Generate an in-character comment for a session event (blocking).
 
@@ -343,11 +363,14 @@ def generate_comment(
         recent_events: Prior session turns (oldest first) to surface as
             context. Used in place of the older single
             ``last_user_event`` shortcut.
+        cwd: Project working directory used to render the diff /
+            surrounding-code blocks. ``None`` skips the change context
+            (text-watcher mode, or no project).
 
     Returns:
         Generated comment string, or None if generation failed.
     """
-    return _run_generate_comment(companion, event, config, max_length, list(recent_events or []))
+    return _run_generate_comment(companion, event, config, max_length, list(recent_events or []), cwd)
 
 
 def generate_idle_chatter(companion: CompanionProfile, config: CompanionConfig, max_length: int = 100) -> str | None:
@@ -372,6 +395,7 @@ def submit_comment(
     config: CompanionConfig,
     max_length: int = 150,
     recent_events: list[SessionEvent] | None = None,
+    cwd: Path | None = None,
 ) -> Future[str | None]:
     """Submit a comment-generation task to the background executor.
 
@@ -386,6 +410,8 @@ def submit_comment(
         max_length: Maximum comment character length.
         recent_events: Prior session turns (oldest first) to thread
             into the user prompt as context.
+        cwd: Project working directory used by the diff layer. ``None``
+            skips the change context block.
 
     Returns:
         Future resolving to the comment string, or None.
@@ -397,6 +423,7 @@ def submit_comment(
         config,
         max_length,
         list(recent_events or []),
+        cwd,
     )
 
 
@@ -406,9 +433,22 @@ def _run_generate_reply(
     config: CompanionConfig,
     max_length: int,
     recent_events: list[SessionEvent],
+    cwd: Path | None,
 ) -> str | None:
-    """Generate an in-character reply to a direct address."""
+    """Generate an in-character reply to a direct address.
+
+    Pulls the most recent assistant turn's touched-paths so the reply
+    sees the same diff context an event-driven comment would. The
+    developer asking "what do you think?" usually means the latest
+    change.
+    """
+    focal_paths: list[str] = []
+    for ev in reversed(recent_events):
+        if ev.touched_paths:
+            focal_paths = ev.touched_paths
+            break
     try:
+        change_context = build_change_context_block(focal_paths, cwd)
         raw = _call_llm(
             system_prompt=build_system_prompt(companion, max_comment_length=max_length),
             user_prompt=build_reply_prompt(
@@ -416,6 +456,7 @@ def _run_generate_reply(
                 message,
                 recent_events=recent_events,
                 recent_comments=_recent_comments_for(companion),
+                change_context=change_context,
                 max_length=max_length,
             ),
             config=config,
@@ -433,6 +474,7 @@ def submit_reply(
     config: CompanionConfig,
     max_length: int = 200,
     recent_events: list[SessionEvent] | None = None,
+    cwd: Path | None = None,
 ) -> Future[str | None]:
     """Submit a direct-reply task to the background executor."""
     return _executor.submit(
@@ -442,6 +484,7 @@ def submit_reply(
         config,
         max_length,
         list(recent_events or []),
+        cwd,
     )
 
 
@@ -478,7 +521,7 @@ def _run_update_memory(
     try:
         raw = _call_llm(
             system_prompt=build_memory_update_system_prompt(companion),
-            user_prompt=build_memory_update_user_prompt(companion.session_memory, observation),
+            user_prompt=build_memory_update_user_prompt(companion, companion.session_memory, observation),
             config=config,
             kind="memory",
         )

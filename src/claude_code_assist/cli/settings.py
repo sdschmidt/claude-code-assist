@@ -35,7 +35,7 @@ from claude_code_assist.config import (
     load_config,
     save_config,
 )
-from claude_code_assist.qt.settings import CompanionSettings, SettingsStore
+from claude_code_assist.qt.settings import CLAUDE_SETTING_SOURCE_VALUES, CompanionSettings, SettingsStore
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -183,10 +183,35 @@ def _edit_model(config: CompanionConfig) -> bool:
     return True
 
 
+def _edit_claude_setting_sources(settings: CompanionSettings) -> bool:
+    """Pick which Claude Code settings file the Agent SDK should load.
+
+    Only relevant when the active provider is ``claude`` — but kept
+    visible regardless so the user can preconfigure it before switching.
+    """
+    current = settings.claude_setting_sources
+    choices = [
+        questionary.Choice(
+            title=f"{v}{'  ← current' if v == current else ''}",
+            value=v,
+        )
+        for v in CLAUDE_SETTING_SOURCE_VALUES
+    ]
+    try:
+        chosen = questionary.select("Claude setting sources:", choices=choices, style=PICKER_STYLE).ask()
+    except (KeyboardInterrupt, EOFError):
+        return False
+    if chosen is None or chosen == current:
+        return False
+    settings.claude_setting_sources = chosen  # type: ignore[assignment]
+    return True
+
+
 # (value, shortcut, label).
 _SETTINGS_ROWS: tuple[tuple[str, str, str], ...] = (
     ("provider", "p", "provider"),
     ("model", "m", "model"),
+    ("claude_setting_sources", "u", "claude setting sources"),
     ("gravity", "g", "gravity"),
     ("walking", "w", "walking"),
     ("scale", "s", "scale"),
@@ -213,6 +238,8 @@ def _row_description(value: str, settings: CompanionSettings, config: CompanionC
         return config.provider_config.provider.value
     if value == "model":
         return config.provider_config.model or default_model_for(config.provider_config.provider)
+    if value == "claude_setting_sources":
+        return settings.claude_setting_sources
     return ""
 
 
@@ -286,6 +313,8 @@ def run(argv: list[str]) -> int:
         elif choice == "creation_prompt_log":
             settings.creation_prompt_log = not settings.creation_prompt_log
             settings_changed = True
+        elif choice == "claude_setting_sources":
+            settings_changed = _edit_claude_setting_sources(settings)
         elif choice == "provider":
             config_changed = _edit_provider(config)
         elif choice == "model":

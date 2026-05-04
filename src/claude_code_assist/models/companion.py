@@ -8,6 +8,32 @@ from claude_code_assist.models.rarity import Rarity
 from claude_code_assist.models.role import Role
 
 
+class PromptOverride(BaseModel):
+    """One user-supplied prompt template, plus a per-kind on/off switch.
+
+    When ``enabled`` is False or ``template`` is empty, the default
+    template baked into ``commentary.prompts`` is used instead.
+    """
+
+    enabled: bool = False
+    template: str = ""
+
+
+class PromptOverrides(BaseModel):
+    """Six independently-toggleable prompt templates per companion.
+
+    Stored on the profile so different companions can run with
+    different prompt experiments side-by-side.
+    """
+
+    system: PromptOverride = Field(default_factory=PromptOverride)
+    event_user: PromptOverride = Field(default_factory=PromptOverride)
+    idle_user: PromptOverride = Field(default_factory=PromptOverride)
+    reply_user: PromptOverride = Field(default_factory=PromptOverride)
+    memory_system: PromptOverride = Field(default_factory=PromptOverride)
+    memory_user: PromptOverride = Field(default_factory=PromptOverride)
+
+
 class CompanionProfile(BaseModel):
     """Complete companion profile with personality, stats, and art."""
 
@@ -97,5 +123,14 @@ class CompanionProfile(BaseModel):
             "background when events rotate out of the rolling context window. Threaded "
             "into the commentary system prompt so the companion has memory beyond the "
             "5-event sliding window. Persisted so memory carries across app restarts."
+        ),
+    )
+    prompt_overrides: PromptOverrides = Field(
+        default_factory=PromptOverrides,
+        description=(
+            "Per-companion prompt template overrides. Six independently-toggleable "
+            "templates (commentary system + event/idle/reply user prompts + memory "
+            "system/user). Defaults preserve current behavior; users can edit "
+            "templates via the tray's Settings → Overwrite prompts dialog."
         ),
     )
